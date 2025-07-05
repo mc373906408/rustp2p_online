@@ -15,7 +15,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::time::Interval;
+use tokio::time::Sleep;
 use tokio_util::sync::PollSender;
 
 pub struct KcpStream {
@@ -369,7 +369,7 @@ async fn kcp_run(
     mut data_out_receiver: Receiver<BytesMut>,
     data_in_sender: Sender<BytesMut>,
 ) -> io::Result<()> {
-    let mut interval = tokio::time::interval(Duration::from_millis(10));
+    let mut interval = Box::pin(tokio::time::sleep(Duration::from_millis(10)));
     let mut buf = vec![0; 65536];
     'out: loop {
         if kcp.is_dead_link() {
@@ -384,6 +384,7 @@ async fn kcp_run(
         match event {
             Event::Input(buf) => {
                 _ = kcp.input(&buf).map_err(|e| Error::other(e))?;
+                _ = kcp.async_flush_ack().await;
             }
             Event::Output(buf) => {
                 _ = kcp.send(&buf).map_err(|e| Error::other(e))?;
@@ -397,6 +398,8 @@ async fn kcp_run(
                 kcp.async_update(millis.as_millis() as _)
                     .await
                     .map_err(|e| Error::other(e))?;
+                let time = kcp.check(millis.as_secs() as _);
+                interval = Box::pin(tokio::time::sleep(Duration::from_millis(time as _)));
             }
         }
 
@@ -411,7 +414,7 @@ async fn kcp_run(
 async fn all_event(
     input: &mut Receiver<BytesMut>,
     data_out_receiver: &mut Receiver<BytesMut>,
-    interval: &mut Interval,
+    interval: &mut Pin<Box<Sleep>>,
 ) -> io::Result<Event> {
     tokio::select! {
         rs=input.recv()=>{
@@ -422,18 +425,21 @@ async fn all_event(
             let buf = rs.ok_or(Error::other("output close"))?;
             Ok(Event::Output(buf))
         }
-        _=interval.tick()=>{
+        _=interval=>{
             Ok(Event::Timeout)
         }
     }
 }
-async fn input_event(input: &mut Receiver<BytesMut>, interval: &mut Interval) -> io::Result<Event> {
+async fn input_event(
+    input: &mut Receiver<BytesMut>,
+    interval: &mut Pin<Box<Sleep>>,
+) -> io::Result<Event> {
     tokio::select! {
         rs=input.recv()=>{
             let buf = rs.ok_or(Error::other("input close"))?;
             Ok(Event::Input(buf))
         }
-        _=interval.tick()=>{
+        _=interval=>{
             Ok(Event::Timeout)
         }
     }
