@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use rand::seq::SliceRandom;
-use rand::Rng;
+use rand::RngExt;
 
 use crate::endpoint::pool::SocketPool;
 use crate::nat::{NatInfo, NatType};

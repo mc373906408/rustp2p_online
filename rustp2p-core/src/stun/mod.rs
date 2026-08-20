@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use crate::nat::NatType;
 use crate::socket::{bind_udp, LocalInterface};
-use rand::RngCore;
+use rand::Rng;
 use stun_format::Attr;
 use tokio::net::UdpSocket;
 
