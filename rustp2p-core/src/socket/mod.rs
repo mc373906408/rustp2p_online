@@ -160,10 +160,10 @@ pub(crate) fn create_tcp0(
         }
     }
     if let Some(ttl) = ttl {
-        _ = socket.set_ttl(ttl as _);
+        _ = socket.set_ttl_v4(ttl as _);
     }
     socket.set_nonblocking(true)?;
-    socket.set_nodelay(true)?;
+    socket.set_tcp_nodelay(true)?;
     let res = socket.connect(&addr.into());
     match res {
         Ok(()) => {}
