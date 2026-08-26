@@ -48,7 +48,7 @@ async fn main() {
     let route_table: RouteTable<u32> = RouteTable::default();
     let sender = ep.sender();
 
-    log::info!("Server listening on {:?}", ep.local_addr().await);
+    log::info!("Server listening on {:?}", ep.local_addr());
 
     while let Some(received) = ep.recv().await {
         let route_table = route_table.clone();
@@ -102,13 +102,13 @@ async fn handler(
                 .unwrap();
                 response.extend_from_slice(json.as_bytes());
                 let peer_addr = peer_route.route_key().peer_addr();
-                let _ = sender.send_to(response.freeze().as_ref(), peer_addr).await;
+                let _ = sender.send_to(response.freeze().as_ref(), peer_addr);
             }
         }
         PUNCH_START_1 | PUNCH_START_2 => match route_table.get_route_by_id(&dest_id) {
             Ok(route) => {
                 let peer_addr = route.route_key().peer_addr();
-                let _ = sender.send_to(data.as_ref(), peer_addr).await;
+                let _ = sender.send_to(data.as_ref(), peer_addr);
             }
             Err(e) => {
                 log::warn!(
@@ -122,7 +122,7 @@ async fn handler(
             response.put_u32(MY_SERVER_ID);
             response.put_u32(src_id);
             response.extend_from_slice(addr.to_string().as_bytes());
-            let _ = sender.send_to(response.freeze().as_ref(), addr).await;
+            let _ = sender.send_to(response.freeze().as_ref(), addr);
         }
         _ => {
             log::warn!(

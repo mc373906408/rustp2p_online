@@ -161,7 +161,7 @@ impl CoreTransportLayer {
         let sender = endpoint.sender();
         let puncher = endpoint.puncher();
         let local_tcp_port = endpoint.local_tcp_port();
-        let raw_local_addr = endpoint.local_addr().await?;
+        let raw_local_addr = endpoint.local_addr()?;
         let local_addr = normalize_local_addr(raw_local_addr, config.bind_addr);
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
         let (control_tx, control_rx) = mpsc::unbounded_channel();
@@ -209,7 +209,7 @@ impl CoreTransportLayer {
     }
 
     async fn send_raw_to_addr(&self, buf: &[u8], addr: SocketAddr) -> io::Result<()> {
-        self.sender.send_to(buf, addr).await
+        self.sender.send_to(buf, addr)
     }
 
     fn try_send_packet(&self, dest: PeerId, data: Bytes) -> io::Result<()> {
@@ -284,7 +284,7 @@ impl CoreTransportLayer {
                                 // The core EndPoint owns the socket pool. Apply the local
                                 // NAT model here instead of routing it through Puncher, whose
                                 // job is remote-peer punching strategy.
-                                let _ = reply.send(endpoint.apply_nat_model(nat_type).await);
+                                let _ = reply.send(endpoint.apply_nat_model(nat_type));
                             }
                         }
                     }
@@ -332,7 +332,7 @@ impl CoreTransportLayer {
         if route_key.protocol().is_tcp() {
             self.sender.write_to(data, route_key.peer_addr()).await
         } else {
-            self.sender.send_to(data, route_key.peer_addr()).await
+            self.sender.send_to(data, route_key.peer_addr())
         }
     }
 }

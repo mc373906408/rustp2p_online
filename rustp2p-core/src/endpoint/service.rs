@@ -27,7 +27,7 @@ pub struct Received {
 /// # #[tokio::main]
 /// # async fn main() -> std::io::Result<()> {
 /// let mut ep = EndPoint::bind(Config::new().udp_port(3000)).await?;
-/// println!("Listening on: {:?}", ep.local_addr().await);
+/// println!("Listening on: {:?}", ep.local_addr());
 ///
 /// while let Some(received) = ep.recv().await {
 ///     println!("From {}: {:?}", received.transport.remote_addr(), received.data);
@@ -101,7 +101,7 @@ impl EndPoint {
                             match result {
                                 Ok((stream, peer_addr)) => {
                                     log::debug!("TCP connection from {peer_addr}");
-                                    if let Err(e) = pool.add_tcp(stream, peer_addr).await {
+                                    if let Err(e) = pool.add_tcp(stream, peer_addr) {
                                         log::warn!("TCP setup error: {e}");
                                     }
                                 }
@@ -124,20 +124,30 @@ impl EndPoint {
 
     /// Creates an endpoint from an existing UDP socket.
     ///
-    /// The given socket becomes the main socket of its address family; the
-    /// other family's main socket is bound automatically on the same port
-    /// when supported.
-    pub async fn from_socket(socket: UdpSocket) -> io::Result<Self> {
+    /// The given socket becomes the main socket of its address family. When it
+    /// is IPv4, pass `main_udp_v6` to provide the main IPv6 socket explicitly;
+    /// `None` auto-binds one on the same port when the system supports IPv6.
+    pub async fn from_socket(
+        socket: UdpSocket,
+        main_udp_v6: Option<UdpSocket>,
+    ) -> io::Result<Self> {
         let local = socket.local_addr()?;
         let (main_v4, main_v6) = if local.is_ipv4() {
-            let v6 = match bind_udp_v6(local.port()) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    log::warn!("IPv6 main socket unavailable, falling back to IPv4 only: {e}");
-                    None
+            match main_udp_v6 {
+                Some(v6) => (socket, Some(v6)),
+                None => {
+                    let v6 = match bind_udp_v6(local.port()) {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            log::warn!(
+                                "IPv6 main socket unavailable, falling back to IPv4 only: {e}"
+                            );
+                            None
+                        }
+                    };
+                    (socket, v6)
                 }
-            };
-            (socket, v6)
+            }
         } else {
             let v4 = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], local.port()))).await?;
             (v4, Some(socket))
@@ -160,8 +170,8 @@ impl EndPoint {
     }
 
     /// Returns the local address this endpoint is bound to.
-    pub async fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.pool.local_addr().await
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.pool.local_addr()
     }
 
     /// Returns the configuration.
@@ -185,10 +195,9 @@ impl EndPoint {
     }
 
     /// Get local UDP ports.
-    pub async fn local_udp_ports(&self) -> Vec<u16> {
+    pub fn local_udp_ports(&self) -> Vec<u16> {
         self.pool
             .udp_sockets()
-            .await
             .iter()
             .filter_map(|s| s.local_addr().ok().map(|addr| addr.port()))
             .collect()
@@ -221,7 +230,7 @@ impl EndPoint {
             .await
             .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
 
-        let local_udp_ports = self.local_udp_ports().await;
+        let local_udp_ports = self.local_udp_ports();
         let local_tcp_port = self.local_tcp_port();
 
         // public_udp_ports starts empty — STUN uses a temporary socket so its
@@ -260,10 +269,10 @@ impl EndPoint {
     ///
     /// - `Symmetric`: add assistant sockets up to `Config::max_assistant_sockets`.
     /// - `Cone`: remove assistant sockets because extra source ports are not needed.
-    pub async fn apply_nat_model(&self, nat_type: crate::nat::NatType) -> io::Result<()> {
+    pub fn apply_nat_model(&self, nat_type: crate::nat::NatType) -> io::Result<()> {
         match nat_type {
             crate::nat::NatType::Symmetric => {
-                let current = self.pool.assistant_count().await;
+                let current = self.pool.assistant_count();
                 let target = self.config.max_assistant_sockets;
                 if target > current {
                     log::debug!(
@@ -274,15 +283,15 @@ impl EndPoint {
                         let socket = crate::socket::bind_udp("0.0.0.0:0".parse().unwrap(), None)?;
                         let std_socket: std::net::UdpSocket = socket.into();
                         let tokio_socket = tokio::net::UdpSocket::from_std(std_socket)?;
-                        self.pool.add_assistant_udp(tokio_socket).await;
+                        self.pool.add_assistant_udp(tokio_socket);
                     }
                 }
             }
             crate::nat::NatType::Cone => {
-                let count = self.pool.assistant_count().await;
+                let count = self.pool.assistant_count();
                 if count > 0 {
                     log::debug!("Cone NAT model selected, cleaning {count} assistant sockets");
-                    self.pool.clean_assistant_udp().await;
+                    self.pool.clean_assistant_udp();
                 }
             }
         }
@@ -391,10 +400,10 @@ mod tests {
         .unwrap();
         let sender = ep.sender();
 
-        ep.apply_nat_model(NatType::Symmetric).await.unwrap();
-        assert_eq!(sender.assistant_count().await, 2);
+        ep.apply_nat_model(NatType::Symmetric).unwrap();
+        assert_eq!(sender.assistant_count(), 2);
 
-        ep.apply_nat_model(NatType::Cone).await.unwrap();
-        assert_eq!(sender.assistant_count().await, 0);
+        ep.apply_nat_model(NatType::Cone).unwrap();
+        assert_eq!(sender.assistant_count(), 0);
     }
 }

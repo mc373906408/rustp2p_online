@@ -88,7 +88,7 @@ async fn main() {
         request.put_u32(UP);
         request.put_u32(my_id);
         request.put_u32(MY_SERVER_ID);
-        sender.send_to(request.freeze().as_ref(), server).await.ok();
+        sender.send_to(request.freeze().as_ref(), server).ok();
     }
 
     let peer_list = Arc::new(Mutex::new(Vec::<u32>::new()));
@@ -131,7 +131,6 @@ async fn main() {
                     request.extend_from_slice(data.as_bytes());
                     sender1
                         .send_to(request.freeze().as_ref(), server)
-                        .await
                         .ok();
                 }
             }
@@ -149,7 +148,6 @@ async fn main() {
             request.put_u32(MY_SERVER_ID);
             sender2
                 .send_to(request.freeze().as_ref(), server)
-                .await
                 .ok();
         }
     });

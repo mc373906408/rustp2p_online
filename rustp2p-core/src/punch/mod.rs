@@ -182,7 +182,7 @@ impl Puncher {
     ) {
         match tokio::time::timeout(timeout, async {
             let stream = crate::socket::connect_tcp(addr, 0, None, ttl).await?;
-            let weak = pool.add_tcp(stream, addr).await?;
+            let weak = pool.add_tcp(stream, addr)?;
             if let Some(data) = buf {
                 if let Some(conn) = weak.upgrade() {
                     let _ = conn.send(data).await;
@@ -223,14 +223,14 @@ impl Puncher {
                 .copied()
                 .collect();
             for addr in &addrs {
-                let _ = self.pool.send_to(buf, *addr).await;
+                let _ = self.pool.send_to(buf, *addr);
             }
         }
         // Send to local addresses (same LAN)
         if !peer_nat_info.local_ipv4_addrs().is_empty() {
             let addrs = peer_nat_info.local_ipv4_addrs();
             for addr in &addrs {
-                let _ = self.pool.send_to(buf, *addr).await;
+                let _ = self.pool.send_to(buf, *addr);
             }
         }
 
@@ -334,7 +334,7 @@ impl Puncher {
                 }
                 for addr in &addrs {
                     log::debug!("punch_cone: sending to {addr}");
-                    self.pool.try_send_via_all(buf, *addr).await;
+                    self.pool.try_send_via_all(buf, *addr);
                 }
             }
         }
@@ -355,7 +355,7 @@ impl Puncher {
                     return index;
                 }
                 let addr = SocketAddr::V4(SocketAddrV4::new(*pub_ip, *port));
-                let _ = self.pool.try_send_via_all(buf, addr).await;
+                let _ = self.pool.try_send_via_all(buf, addr);
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         }

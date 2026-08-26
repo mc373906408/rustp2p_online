@@ -4,7 +4,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 use tokio::net::UdpSocket;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc};
 
 use crate::endpoint::codec::InitCodec;
 
@@ -39,8 +39,8 @@ impl TcpConnection {
 pub struct SocketPool {
     main_udp_v4: Arc<UdpSocket>,
     main_udp_v6: Option<Arc<UdpSocket>>,
-    assistant_udp: RwLock<Vec<UdpEntry>>,
-    tcp_conns: RwLock<HashMap<SocketAddr, Arc<TcpConnection>>>,
+    assistant_udp: parking_lot::RwLock<Vec<UdpEntry>>,
+    tcp_conns: parking_lot::RwLock<HashMap<SocketAddr, Arc<TcpConnection>>>,
     data_tx: mpsc::Sender<(super::transport::Transport, Bytes)>,
     /// Global shutdown - kills ALL tasks (main + sub)
     global_shutdown: broadcast::Sender<()>,
@@ -70,8 +70,8 @@ impl SocketPool {
         let pool = Self {
             main_udp_v4,
             main_udp_v6,
-            assistant_udp: RwLock::new(Vec::new()),
-            tcp_conns: RwLock::new(HashMap::new()),
+            assistant_udp: parking_lot::RwLock::new(Vec::new()),
+            tcp_conns: parking_lot::RwLock::new(HashMap::new()),
             data_tx,
             global_shutdown,
             init_codec,
@@ -106,7 +106,7 @@ impl SocketPool {
 
     /// Add an assistant UDP socket (for symmetric NAT probing).
     /// Its reader task exits when the assistant socket is removed.
-    pub async fn add_assistant_udp(&self, socket: UdpSocket) -> Weak<UdpSocket> {
+    pub fn add_assistant_udp(&self, socket: UdpSocket) -> Weak<UdpSocket> {
         let socket = Arc::new(socket);
         let weak = Arc::downgrade(&socket);
 
@@ -146,7 +146,7 @@ impl SocketPool {
             _shutdown: socket_shutdown,
         };
 
-        let mut sockets = self.assistant_udp.write().await;
+        let mut sockets = self.assistant_udp.write();
         sockets.push(entry);
         drop(sockets);
 
@@ -154,19 +154,19 @@ impl SocketPool {
     }
 
     /// Clean all assistant UDP sockets and cancel their reader tasks.
-    pub async fn clean_assistant_udp(&self) {
-        let mut sockets = self.assistant_udp.write().await;
+    pub fn clean_assistant_udp(&self) {
+        let mut sockets = self.assistant_udp.write();
         // Dropping UdpEntry drops _shutdown Sender, reader task exits.
         sockets.clear();
     }
 
     /// Remove a TCP connection from the pool by peer address.
-    pub(crate) async fn remove_tcp(&self, addr: SocketAddr) {
-        self.tcp_conns.write().await.remove(&addr);
+    pub(crate) fn remove_tcp(&self, addr: SocketAddr) {
+        self.tcp_conns.write().remove(&addr);
     }
 
     /// Add a TCP connection with Decoder/Encoder.
-    pub async fn add_tcp(
+    pub fn add_tcp(
         self: &Arc<Self>,
         stream: tokio::net::TcpStream,
         peer_addr: SocketAddr,
@@ -215,7 +215,7 @@ impl SocketPool {
                     }
                 }
             }
-            pool_for_read.remove_tcp(peer_addr).await;
+            pool_for_read.remove_tcp(peer_addr);
         });
 
         // Write loop using Encoder
@@ -243,24 +243,28 @@ impl SocketPool {
                     }
                 }
             }
-            pool_for_write.remove_tcp(peer_addr).await;
+            pool_for_write.remove_tcp(peer_addr);
         });
 
         let weak = Arc::downgrade(&conn);
-        self.tcp_conns.write().await.insert(peer_addr, conn);
+        self.tcp_conns.write().insert(peer_addr, conn);
         Ok(weak)
     }
 
     /// Send data through ALL assistant UDP sockets to a specific address.
-    pub async fn send_via_assistants(&self, buf: &[u8], addr: SocketAddr) {
-        let sockets = self.assistant_udp.read().await;
+    pub fn try_send_via_assistants(&self, buf: &[u8], addr: SocketAddr) -> io::Result<()> {
+        let sockets = self.assistant_udp.read();
         for entry in sockets.iter() {
-            let _ = entry.socket.try_send_to(buf, addr);
+            entry
+                .socket
+                .try_send_to(buf, addr)
+                .map_err(|e| io::Error::other(format!("assistant send failed: {e}")))?;
         }
+        Ok(())
     }
 
     /// Send data to an address via the matching family main UDP socket.
-    pub async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<()> {
+    pub fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<()> {
         if addr.is_ipv4() {
             return self
                 .main_udp_v4
@@ -278,12 +282,12 @@ impl SocketPool {
     }
 
     /// Send data through ALL UDP sockets (main v4/v6 + assistant) to a specific address.
-    pub async fn try_send_via_all(&self, buf: &[u8], addr: SocketAddr) {
+    pub fn try_send_via_all(&self, buf: &[u8], addr: SocketAddr) {
         let _ = self.main_udp_v4.try_send_to(buf, addr);
         if let Some(v6) = &self.main_udp_v6 {
             let _ = v6.try_send_to(buf, addr);
         }
-        let sockets = self.assistant_udp.read().await;
+        let sockets = self.assistant_udp.read();
         for entry in sockets.iter() {
             let _ = entry.socket.try_send_to(buf, addr);
         }
@@ -300,13 +304,13 @@ impl SocketPool {
     }
 
     /// Get local address of the main IPv4 UDP socket.
-    pub async fn local_addr(&self) -> io::Result<SocketAddr> {
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.main_udp_v4.local_addr()
     }
 
     /// Find a TCP connection by peer address.
-    pub async fn find_tcp(&self, addr: SocketAddr) -> Option<Arc<TcpConnection>> {
-        self.tcp_conns.read().await.get(&addr).cloned()
+    pub fn find_tcp(&self, addr: SocketAddr) -> Option<Arc<TcpConnection>> {
+        self.tcp_conns.read().get(&addr).cloned()
     }
 
     /// Get or create a TCP connection to the given address (with concurrency protection).
@@ -314,27 +318,27 @@ impl SocketPool {
         self: &Arc<Self>,
         addr: SocketAddr,
     ) -> io::Result<Arc<TcpConnection>> {
-        if let Some(conn) = self.find_tcp(addr).await {
+        if let Some(conn) = self.find_tcp(addr) {
             return Ok(conn);
         }
         let _guard = self.connect_lock.lock().await;
-        if let Some(conn) = self.find_tcp(addr).await {
+        if let Some(conn) = self.find_tcp(addr) {
             return Ok(conn);
         }
         let stream = crate::socket::connect_tcp(addr, 0, None, None).await?;
-        let weak = self.add_tcp(stream, addr).await?;
+        let weak = self.add_tcp(stream, addr)?;
         weak.upgrade()
             .ok_or_else(|| io::Error::other("connection dropped immediately"))
     }
 
     /// Get all TCP connections.
-    pub async fn tcp_connections(&self) -> Vec<Arc<TcpConnection>> {
-        self.tcp_conns.read().await.values().cloned().collect()
+    pub fn tcp_connections(&self) -> Vec<Arc<TcpConnection>> {
+        self.tcp_conns.read().values().cloned().collect()
     }
 
     /// Get a UDP socket by index: 0 = main IPv4, then main IPv6 (if present),
     /// then assistants.
-    pub async fn udp_socket(&self, index: usize) -> Option<Arc<UdpSocket>> {
+    pub fn udp_socket(&self, index: usize) -> Option<Arc<UdpSocket>> {
         let main_count = 1 + usize::from(self.main_udp_v6.is_some());
         match index {
             0 => Some(self.main_udp_v4.clone()),
@@ -342,20 +346,18 @@ impl SocketPool {
             _ => self
                 .assistant_udp
                 .read()
-                .await
                 .get(index - main_count)
                 .map(|e| e.socket.clone()),
         }
     }
 
     /// Get all UDP sockets: main IPv4, main IPv6 (if present), then assistants.
-    pub async fn udp_sockets(&self) -> Vec<Arc<UdpSocket>> {
+    pub fn udp_sockets(&self) -> Vec<Arc<UdpSocket>> {
         let mut sockets = vec![self.main_udp_v4.clone()];
         sockets.extend(self.main_udp_v6.iter().cloned());
         sockets.extend(
             self.assistant_udp
                 .read()
-                .await
                 .iter()
                 .map(|e| e.socket.clone()),
         );
@@ -363,12 +365,12 @@ impl SocketPool {
     }
 
     /// Get the number of assistant sockets.
-    pub async fn assistant_count(&self) -> usize {
-        self.assistant_udp.read().await.len()
+    pub fn assistant_count(&self) -> usize {
+        self.assistant_udp.read().len()
     }
 
     /// Get the main IPv4 UDP socket.
-    pub async fn main_socket(&self) -> Option<Arc<UdpSocket>> {
+    pub fn main_socket(&self) -> Option<Arc<UdpSocket>> {
         Some(self.main_udp_v4.clone())
     }
 
@@ -466,10 +468,10 @@ impl SocketPool {
 /// let sender = ep.sender();
 ///
 /// // Send to a known address
-/// sender.try_send_via_all(b"hello", "127.0.0.1:4000".parse().unwrap()).await;
+/// sender.try_send_via_all(b"hello", "127.0.0.1:4000".parse().unwrap());
 ///
 /// // Query local address
-/// println!("Listening on: {:?}", sender.local_addr().await);
+/// println!("Listening on: {:?}", sender.local_addr());
 /// # Ok(())
 /// # }
 /// ```
@@ -480,50 +482,50 @@ impl Sender {
     // === Send methods ===
 
     /// Send data through ALL UDP sockets (main + assistant) to a specific address.
-    pub async fn try_send_via_all(&self, buf: &[u8], addr: SocketAddr) {
-        self.0.try_send_via_all(buf, addr).await;
+    pub fn try_send_via_all(&self, buf: &[u8], addr: SocketAddr) {
+        self.0.try_send_via_all(buf, addr);
     }
 
     /// Send data to an address via the main UDP socket.
-    pub async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<()> {
-        self.0.send_to(buf, addr).await
+    pub fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<()> {
+        self.0.send_to(buf, addr)
     }
 
     /// Send data through ALL assistant UDP sockets to a specific address.
-    pub async fn send_via_assistants(&self, buf: &[u8], addr: SocketAddr) {
-        self.0.send_via_assistants(buf, addr).await;
+    pub fn try_send_via_assistants(&self, buf: &[u8], addr: SocketAddr) -> io::Result<()> {
+        self.0.try_send_via_assistants(buf, addr)
     }
 
     // === Read-only query methods ===
 
-    /// Get local address of first UDP socket.
-    pub async fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.0.local_addr().await
+    /// Get local address of the main IPv4 UDP socket.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.0.local_addr()
     }
 
     /// Get the number of assistant sockets.
-    pub async fn assistant_count(&self) -> usize {
-        self.0.assistant_count().await
+    pub fn assistant_count(&self) -> usize {
+        self.0.assistant_count()
     }
 
     /// Get all UDP sockets.
-    pub async fn udp_sockets(&self) -> Vec<Arc<UdpSocket>> {
-        self.0.udp_sockets().await
+    pub fn udp_sockets(&self) -> Vec<Arc<UdpSocket>> {
+        self.0.udp_sockets()
     }
 
     /// Get a UDP socket by index.
-    pub async fn udp_socket(&self, index: usize) -> Option<Arc<UdpSocket>> {
-        self.0.udp_socket(index).await
+    pub fn udp_socket(&self, index: usize) -> Option<Arc<UdpSocket>> {
+        self.0.udp_socket(index)
     }
 
     /// Find a TCP connection by peer address.
-    pub async fn find_tcp(&self, addr: SocketAddr) -> Option<Arc<TcpConnection>> {
-        self.0.find_tcp(addr).await
+    pub fn find_tcp(&self, addr: SocketAddr) -> Option<Arc<TcpConnection>> {
+        self.0.find_tcp(addr)
     }
 
     /// Get all TCP connections.
-    pub async fn tcp_connections(&self) -> Vec<Arc<TcpConnection>> {
-        self.0.tcp_connections().await
+    pub fn tcp_connections(&self) -> Vec<Arc<TcpConnection>> {
+        self.0.tcp_connections()
     }
 
     // === TCP connection methods ===
