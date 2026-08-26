@@ -3,10 +3,19 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
+#[cfg(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android")))]
+use std::{mem, os::fd::AsRawFd};
+#[cfg(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android")))]
+use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::endpoint::codec::InitCodec;
+
+#[cfg(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android")))]
+const UDP_BATCH_SIZE: usize = 16;
+#[cfg(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android")))]
+const UDP_RECV_BUFFER_SIZE: usize = 65_536;
 
 /// A managed assistant UDP socket entry with its own shutdown signal.
 struct UdpEntry {
@@ -93,14 +102,27 @@ impl SocketPool {
         let data_tx_clone = data_tx.clone();
         let s = socket.clone();
         tokio::spawn(async move {
-            Self::run_udp_reader(s, write_tx, data_tx_clone, &mut global_shutdown_rx, &mut socket_shutdown_rx).await;
+            Self::run_udp_reader(
+                s,
+                write_tx,
+                data_tx_clone,
+                &mut global_shutdown_rx,
+                &mut socket_shutdown_rx,
+            )
+            .await;
         });
 
         let mut global_shutdown_rx = global_shutdown.subscribe();
         let mut socket_shutdown_rx = global_shutdown.subscribe();
         let s = socket.clone();
         tokio::spawn(async move {
-            Self::run_udp_writer(s, write_rx, &mut global_shutdown_rx, &mut socket_shutdown_rx).await;
+            Self::run_udp_writer(
+                s,
+                write_rx,
+                &mut global_shutdown_rx,
+                &mut socket_shutdown_rx,
+            )
+            .await;
         });
     }
 
@@ -355,12 +377,7 @@ impl SocketPool {
     pub fn udp_sockets(&self) -> Vec<Arc<UdpSocket>> {
         let mut sockets = vec![self.main_udp_v4.clone()];
         sockets.extend(self.main_udp_v6.iter().cloned());
-        sockets.extend(
-            self.assistant_udp
-                .read()
-                .iter()
-                .map(|e| e.socket.clone()),
-        );
+        sockets.extend(self.assistant_udp.read().iter().map(|e| e.socket.clone()));
         sockets
     }
 
@@ -381,6 +398,38 @@ impl SocketPool {
         global_shutdown_rx: &mut broadcast::Receiver<()>,
         socket_shutdown_rx: &mut broadcast::Receiver<()>,
     ) {
+        #[cfg(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android")))]
+        {
+            Self::run_udp_reader_mmsg(
+                socket,
+                write_tx,
+                data_tx,
+                global_shutdown_rx,
+                socket_shutdown_rx,
+            )
+            .await;
+        }
+        #[cfg(not(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android"))))]
+        {
+            Self::run_udp_reader_single(
+                socket,
+                write_tx,
+                data_tx,
+                global_shutdown_rx,
+                socket_shutdown_rx,
+            )
+            .await;
+        }
+    }
+
+    #[cfg(not(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android"))))]
+    async fn run_udp_reader_single(
+        socket: Arc<UdpSocket>,
+        write_tx: mpsc::Sender<(Bytes, SocketAddr)>,
+        data_tx: mpsc::Sender<(super::transport::Transport, Bytes)>,
+        global_shutdown_rx: &mut broadcast::Receiver<()>,
+        socket_shutdown_rx: &mut broadcast::Receiver<()>,
+    ) {
         let mut buf = [0u8; 65536];
         let local_addr = socket
             .local_addr()
@@ -389,13 +438,16 @@ impl SocketPool {
             tokio::select! {
                 result = socket.recv_from(&mut buf) => {
                     match result {
-                        Ok((0, _)) => break,
                         Ok((len, addr)) => {
                             let data = Bytes::copy_from_slice(&buf[..len]);
                             let route = super::transport::Transport::udp(write_tx.clone(), local_addr, addr);
                             if data_tx.send((route, data)).await.is_err() {
-                                break;
+                                return;
                             }
+                        }
+                        Err(e) if is_recoverable_udp_recv_error(&e) => {
+                            log::debug!("Ignoring recoverable UDP recv error: {e}");
+                            continue;
                         }
                         Err(e) => {
                             log::warn!("UDP recv error: {e}");
@@ -415,10 +467,87 @@ impl SocketPool {
         }
     }
 
+    #[cfg(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android")))]
+    async fn run_udp_reader_mmsg(
+        socket: Arc<UdpSocket>,
+        write_tx: mpsc::Sender<(Bytes, SocketAddr)>,
+        data_tx: mpsc::Sender<(super::transport::Transport, Bytes)>,
+        global_shutdown_rx: &mut broadcast::Receiver<()>,
+        socket_shutdown_rx: &mut broadcast::Receiver<()>,
+    ) {
+        let mut buffers = (0..UDP_BATCH_SIZE)
+            .map(|_| Vec::with_capacity(UDP_RECV_BUFFER_SIZE))
+            .collect::<Vec<_>>();
+        let mut peer_addrs = [SocketAddr::from(([0, 0, 0, 0], 0)); UDP_BATCH_SIZE];
+        let local_addr = socket
+            .local_addr()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+        let fd = socket.as_raw_fd();
+
+        loop {
+            let count = tokio::select! {
+                result = socket.async_io(Interest::READABLE, || {
+                    recv_mmsg(fd, &mut buffers, &mut peer_addrs)
+                }) => {
+                    match result {
+                        Ok(count) => count,
+                        Err(e) if is_recoverable_udp_recv_error(&e) => {
+                            log::debug!("Ignoring recoverable UDP recvmmsg error: {e}");
+                            continue;
+                        }
+                        Err(e) => {
+                            log::warn!("UDP recvmmsg error: {e}");
+                            break;
+                        }
+                    }
+                }
+                _ = global_shutdown_rx.recv() => {
+                    log::debug!("UDP read task shutting down (global)");
+                    break;
+                }
+                _ = socket_shutdown_rx.recv() => {
+                    log::debug!("UDP read task shutting down (socket)");
+                    break;
+                }
+            };
+
+            for index in 0..count {
+                let data = Bytes::copy_from_slice(&buffers[index]);
+                let route = super::transport::Transport::udp(
+                    write_tx.clone(),
+                    local_addr,
+                    peer_addrs[index],
+                );
+                if data_tx.send((route, data)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
     /// Writer task for a UDP socket: drains `(data, peer)` messages from the
     /// channel and sends them through the socket. Exits when the channel
     /// closes or either shutdown signal fires.
     async fn run_udp_writer(
+        socket: Arc<UdpSocket>,
+        write_rx: mpsc::Receiver<(Bytes, SocketAddr)>,
+        global_shutdown_rx: &mut broadcast::Receiver<()>,
+        socket_shutdown_rx: &mut broadcast::Receiver<()>,
+    ) {
+        #[cfg(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android")))]
+        {
+            Self::run_udp_writer_mmsg(socket, write_rx, global_shutdown_rx, socket_shutdown_rx)
+                .await;
+        }
+        #[cfg(not(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android"))))]
+        {
+            Self::run_udp_writer_single(socket, write_rx, global_shutdown_rx, socket_shutdown_rx)
+                .await;
+        }
+    }
+
+    #[cfg(not(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android"))))]
+    async fn run_udp_writer_single(
         socket: Arc<UdpSocket>,
         mut write_rx: mpsc::Receiver<(Bytes, SocketAddr)>,
         global_shutdown_rx: &mut broadcast::Receiver<()>,
@@ -448,6 +577,317 @@ impl SocketPool {
         }
         // Keep socket alive until writer exits
         drop(socket);
+    }
+
+    #[cfg(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android")))]
+    async fn run_udp_writer_mmsg(
+        socket: Arc<UdpSocket>,
+        mut write_rx: mpsc::Receiver<(Bytes, SocketAddr)>,
+        global_shutdown_rx: &mut broadcast::Receiver<()>,
+        socket_shutdown_rx: &mut broadcast::Receiver<()>,
+    ) {
+        let fd = socket.as_raw_fd();
+        let mut batch = Vec::with_capacity(UDP_BATCH_SIZE);
+
+        'writer: loop {
+            batch.clear();
+            let first = tokio::select! {
+                msg = write_rx.recv() => msg,
+                _ = global_shutdown_rx.recv() => {
+                    log::debug!("UDP write task shutting down (global)");
+                    break;
+                }
+                _ = socket_shutdown_rx.recv() => {
+                    log::debug!("UDP write task shutting down (socket)");
+                    break;
+                }
+            };
+            let Some(first) = first else {
+                break;
+            };
+            batch.push(first);
+            while batch.len() < UDP_BATCH_SIZE {
+                match write_rx.try_recv() {
+                    Ok(message) => batch.push(message),
+                    Err(_) => break,
+                }
+            }
+
+            let mut sent = 0;
+            while sent < batch.len() {
+                if batch.len() - sent == 1 {
+                    let (data, addr) = &batch[sent];
+                    let result = tokio::select! {
+                        result = socket.send_to(data, *addr) => Some(result),
+                        _ = global_shutdown_rx.recv() => {
+                            log::debug!("UDP write task shutting down (global)");
+                            None
+                        }
+                        _ = socket_shutdown_rx.recv() => {
+                            log::debug!("UDP write task shutting down (socket)");
+                            None
+                        }
+                    };
+                    let Some(result) = result else {
+                        break 'writer;
+                    };
+                    if let Err(e) = result {
+                        log::warn!("UDP send error: {e}");
+                    }
+                    sent += 1;
+                    continue;
+                }
+
+                let result = tokio::select! {
+                    result = socket.async_io(Interest::WRITABLE, || {
+                        send_mmsg(fd, &batch[sent..])
+                    }) => Some(result),
+                    _ = global_shutdown_rx.recv() => {
+                        log::debug!("UDP write task shutting down (global)");
+                        None
+                    }
+                    _ = socket_shutdown_rx.recv() => {
+                        log::debug!("UDP write task shutting down (socket)");
+                        None
+                    }
+                };
+                let Some(result) = result else {
+                    break 'writer;
+                };
+                match result {
+                    Ok(count) => sent += count,
+                    Err(batch_error) => {
+                        // sendmmsg returns an error only if it sent no messages.
+                        // Retry the first message separately so one bad datagram
+                        // does not cause the rest of the batch to be discarded.
+                        let (data, addr) = &batch[sent];
+                        let result = tokio::select! {
+                            result = socket.send_to(data, *addr) => Some(result),
+                            _ = global_shutdown_rx.recv() => {
+                                log::debug!("UDP write task shutting down (global)");
+                                None
+                            }
+                            _ = socket_shutdown_rx.recv() => {
+                                log::debug!("UDP write task shutting down (socket)");
+                                None
+                            }
+                        };
+                        let Some(result) = result else {
+                            break 'writer;
+                        };
+                        if let Err(e) = result {
+                            log::warn!(
+                                "UDP sendmmsg error: {batch_error}; single send to {addr} failed: {e}"
+                            );
+                        } else {
+                            log::warn!(
+                                "UDP sendmmsg error: {batch_error}; retried {addr} successfully"
+                            );
+                        }
+                        sent += 1;
+                    }
+                }
+            }
+        }
+        drop(socket);
+    }
+}
+
+fn is_recoverable_udp_recv_error(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::Interrupted {
+        return true;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(code) = error.raw_os_error() {
+        return matches!(
+            code,
+            libc::ECONNREFUSED
+                | libc::ECONNRESET
+                | libc::ECONNABORTED
+                | libc::EHOSTUNREACH
+                | libc::ENETUNREACH
+                | libc::EADDRNOTAVAIL
+                | libc::EPROTO
+                | libc::EMSGSIZE
+        );
+    }
+
+    false
+}
+
+#[cfg(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android")))]
+fn recv_mmsg(
+    fd: std::os::fd::RawFd,
+    buffers: &mut [Vec<u8>],
+    peer_addrs: &mut [SocketAddr],
+) -> io::Result<usize> {
+    let count = buffers.len().min(peer_addrs.len()).min(UDP_BATCH_SIZE);
+    if count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "recvmmsg requires at least one buffer",
+        ));
+    }
+
+    let mut iovecs: [libc::iovec; UDP_BATCH_SIZE] = unsafe { mem::zeroed() };
+    let mut messages: [libc::mmsghdr; UDP_BATCH_SIZE] = unsafe { mem::zeroed() };
+    let mut addresses: [libc::sockaddr_storage; UDP_BATCH_SIZE] = unsafe { mem::zeroed() };
+
+    for index in 0..count {
+        buffers[index].clear();
+        iovecs[index].iov_base = buffers[index].as_mut_ptr().cast();
+        iovecs[index].iov_len = buffers[index].capacity();
+        messages[index].msg_hdr.msg_iov = &mut iovecs[index];
+        messages[index].msg_hdr.msg_iovlen = 1;
+        messages[index].msg_hdr.msg_name =
+            (&mut addresses[index] as *mut libc::sockaddr_storage).cast::<libc::c_void>();
+        messages[index].msg_hdr.msg_namelen =
+            mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    }
+
+    let received = loop {
+        let result = unsafe {
+            libc::recvmmsg(
+                fd,
+                messages.as_mut_ptr(),
+                count as libc::c_uint,
+                libc::MSG_DONTWAIT as _,
+                std::ptr::null_mut(),
+            )
+        };
+        if result >= 0 {
+            break result as usize;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    };
+    if received == 0 {
+        return Err(io::Error::from(io::ErrorKind::WouldBlock));
+    }
+
+    for index in 0..received {
+        peer_addrs[index] =
+            sockaddr_to_socket_addr(&addresses[index], messages[index].msg_hdr.msg_namelen)?;
+        let length = (messages[index].msg_len as usize).min(buffers[index].capacity());
+        // SAFETY: recvmmsg initialized exactly `msg_len` bytes in this
+        // buffer, capped above by the iovec capacity supplied to the kernel.
+        unsafe {
+            buffers[index].set_len(length);
+        }
+    }
+    Ok(received)
+}
+
+#[cfg(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android")))]
+fn send_mmsg(fd: std::os::fd::RawFd, buffers: &[(Bytes, SocketAddr)]) -> io::Result<usize> {
+    let count = buffers.len().min(UDP_BATCH_SIZE);
+    if count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sendmmsg requires at least one message",
+        ));
+    }
+
+    let mut iovecs: [libc::iovec; UDP_BATCH_SIZE] = unsafe { mem::zeroed() };
+    let mut messages: [libc::mmsghdr; UDP_BATCH_SIZE] = unsafe { mem::zeroed() };
+    let mut addresses: [libc::sockaddr_storage; UDP_BATCH_SIZE] = unsafe { mem::zeroed() };
+
+    for (index, (buffer, addr)) in buffers[..count].iter().enumerate() {
+        let (storage, addr_len) = socket_addr_to_sockaddr(addr);
+        addresses[index] = storage;
+        iovecs[index].iov_base = buffer.as_ptr() as *mut libc::c_void;
+        iovecs[index].iov_len = buffer.len();
+        messages[index].msg_hdr.msg_iov = &mut iovecs[index];
+        messages[index].msg_hdr.msg_iovlen = 1;
+        messages[index].msg_hdr.msg_name =
+            (&mut addresses[index] as *mut libc::sockaddr_storage).cast::<libc::c_void>();
+        messages[index].msg_hdr.msg_namelen = addr_len;
+    }
+
+    loop {
+        let sent = unsafe {
+            libc::sendmmsg(
+                fd,
+                messages.as_mut_ptr(),
+                count as libc::c_uint,
+                libc::MSG_DONTWAIT as _,
+            )
+        };
+        if sent > 0 {
+            return Ok(sent as usize);
+        }
+        if sent == 0 {
+            return Err(io::Error::from(io::ErrorKind::WriteZero));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android")))]
+fn socket_addr_to_sockaddr(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+    match addr {
+        SocketAddr::V4(addr) => {
+            let raw = (&mut storage as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in>();
+            unsafe {
+                (*raw).sin_family = libc::AF_INET as libc::sa_family_t;
+                (*raw).sin_port = addr.port().to_be();
+                (*raw).sin_addr.s_addr = u32::from_ne_bytes(addr.ip().octets());
+            }
+            (
+                storage,
+                mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        }
+        SocketAddr::V6(addr) => {
+            let raw = (&mut storage as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in6>();
+            unsafe {
+                (*raw).sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                (*raw).sin6_port = addr.port().to_be();
+                (*raw).sin6_flowinfo = addr.flowinfo();
+                (*raw).sin6_addr.s6_addr = addr.ip().octets();
+                (*raw).sin6_scope_id = addr.scope_id();
+            }
+            (
+                storage,
+                mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
+        }
+    }
+}
+
+#[cfg(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android")))]
+fn sockaddr_to_socket_addr(
+    storage: &libc::sockaddr_storage,
+    len: libc::socklen_t,
+) -> io::Result<SocketAddr> {
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET if (len as usize) >= mem::size_of::<libc::sockaddr_in>() => {
+            let addr = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
+            Ok(SocketAddr::V4(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)),
+                u16::from_be(addr.sin_port),
+            )))
+        }
+        libc::AF_INET6 if (len as usize) >= mem::size_of::<libc::sockaddr_in6>() => {
+            let addr = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
+            Ok(SocketAddr::V6(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr),
+                u16::from_be(addr.sin6_port),
+                addr.sin6_flowinfo,
+                addr.sin6_scope_id,
+            )))
+        }
+        family => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported sockaddr family or length: family={family}, len={len}"),
+        )),
     }
 }
 
@@ -542,5 +982,115 @@ impl Sender {
     pub async fn write_to(&self, data: &[u8], addr: SocketAddr) -> io::Result<()> {
         let conn = self.0.connect_tcp_internal(addr).await?;
         conn.send(data).await
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "sendmmsg",
+    any(target_os = "linux", target_os = "android")
+))]
+mod mmsg_tests {
+    use super::{
+        is_recoverable_udp_recv_error, recv_mmsg, send_mmsg, sockaddr_to_socket_addr,
+        socket_addr_to_sockaddr, Interest, SocketAddr, UdpSocket, UDP_BATCH_SIZE,
+        UDP_RECV_BUFFER_SIZE,
+    };
+    use bytes::Bytes;
+    use std::io;
+    use std::net::{Ipv6Addr, SocketAddrV6};
+    use std::os::fd::AsRawFd;
+    use std::time::Duration;
+
+    #[test]
+    fn sockaddr_round_trip_preserves_ipv4_and_ipv6_fields() -> io::Result<()> {
+        let addresses = [
+            SocketAddr::from(([127, 0, 0, 1], 32123)),
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 32124, 0x12345, 7)),
+        ];
+
+        for expected in addresses {
+            let (storage, len) = socket_addr_to_sockaddr(&expected);
+            if let SocketAddr::V6(expected) = expected {
+                let raw = unsafe {
+                    &*(&storage as *const libc::sockaddr_storage as *const libc::sockaddr_in6)
+                };
+                assert_eq!(raw.sin6_flowinfo, expected.flowinfo());
+            }
+            assert_eq!(sockaddr_to_socket_addr(&storage, len)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn classifies_async_network_errors_as_recoverable() {
+        for code in [
+            libc::ECONNREFUSED,
+            libc::ECONNRESET,
+            libc::EHOSTUNREACH,
+            libc::ENETUNREACH,
+            libc::EMSGSIZE,
+        ] {
+            assert!(is_recoverable_udp_recv_error(
+                &io::Error::from_raw_os_error(code)
+            ));
+        }
+        assert!(!is_recoverable_udp_recv_error(
+            &io::Error::from_raw_os_error(libc::EBADF)
+        ));
+    }
+
+    #[tokio::test]
+    async fn sendmmsg_and_recvmmsg_round_trip_batch() -> io::Result<()> {
+        let receiver = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let sender = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let receiver_addr = receiver.local_addr()?;
+        let sender_addr = sender.local_addr()?;
+        let messages = [
+            (Bytes::from_static(b"first"), receiver_addr),
+            (Bytes::new(), receiver_addr),
+            (Bytes::from_static(b"third"), receiver_addr),
+        ];
+
+        let mut sent = 0;
+        while sent < messages.len() {
+            sent += sender
+                .async_io(Interest::WRITABLE, || {
+                    send_mmsg(sender.as_raw_fd(), &messages[sent..])
+                })
+                .await?;
+        }
+
+        let received = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut buffers = (0..UDP_BATCH_SIZE)
+                .map(|_| Vec::with_capacity(UDP_RECV_BUFFER_SIZE))
+                .collect::<Vec<_>>();
+            let mut peer_addrs = [SocketAddr::from(([0, 0, 0, 0], 0)); UDP_BATCH_SIZE];
+            let mut received = Vec::new();
+
+            while received.len() < messages.len() {
+                let count = receiver
+                    .async_io(Interest::READABLE, || {
+                        recv_mmsg(receiver.as_raw_fd(), &mut buffers, &mut peer_addrs)
+                    })
+                    .await?;
+                for index in 0..count {
+                    received.push((Bytes::copy_from_slice(&buffers[index]), peer_addrs[index]));
+                }
+            }
+            Ok::<_, io::Error>(received)
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "mmsg round trip timed out"))??;
+
+        assert_eq!(
+            received,
+            vec![
+                (Bytes::from_static(b"first"), sender_addr),
+                (Bytes::new(), sender_addr),
+                (Bytes::from_static(b"third"), sender_addr),
+            ]
+        );
+        Ok(())
     }
 }

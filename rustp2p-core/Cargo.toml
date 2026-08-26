@@ -45,7 +45,8 @@ log = "0.4.22"
 env_logger = "0.11.5"
 
 [features]
-sendmmsg=[]
+# Use recvmmsg(2)/sendmmsg(2) for endpoint UDP tasks on Linux/Android.
+sendmmsg = []
 
 [[example]]
 name = "server"
