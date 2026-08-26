@@ -327,7 +327,7 @@ impl CoreTransportLayer {
 
     async fn send_to_route(&self, route_key: RouteKey, data: &[u8]) -> io::Result<()> {
         if let Some(transport) = self.transports.get(&route_key) {
-            return transport.send(data).await;
+            return transport.send(Bytes::copy_from_slice(data)).await;
         }
         if route_key.protocol().is_tcp() {
             self.sender.write_to(data, route_key.peer_addr()).await

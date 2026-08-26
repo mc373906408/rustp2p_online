@@ -34,6 +34,7 @@ rustp2p-core = "0.1"
 ### Echo Endpoint
 
 ```rust
+use bytes::Bytes;
 use rustp2p_core::endpoint::{Config, EndPoint};
 
 #[tokio::main]
@@ -47,7 +48,7 @@ async fn main() -> std::io::Result<()> {
             received.transport.protocol(),
             received.data
         );
-        received.transport.send(b"echo").await?;
+        received.transport.send(Bytes::from_static(b"echo")).await?;
     }
 
     Ok(())

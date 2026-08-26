@@ -5,6 +5,7 @@
 //! # Quick Start
 //!
 //! ```rust,no_run
+//! use bytes::Bytes;
 //! use rustp2p_core::endpoint::{EndPoint, Config};
 //!
 //! # #[tokio::main]
@@ -13,7 +14,7 @@
 //!
 //! while let Some(received) = ep.recv().await {
 //!     println!("From {}: {:?}", received.transport.remote_addr(), received.data);
-//!     received.transport.send(b"echo").await?;
+//!     received.transport.send(Bytes::from_static(b"echo")).await?;
 //! }
 //! # Ok(())
 //! # }

@@ -1,26 +1,27 @@
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Weak;
-use tokio::net::UdpSocket;
+use bytes::Bytes;
+use tokio::sync::mpsc;
 
-use crate::endpoint::pool::TcpConnection;
 use crate::route_table::{Protocol, RouteKey};
 
-/// A transport handle to a peer, holding a Weak reference to the socket.
+/// A transport handle to a peer.
 ///
 /// Transport is a send handle - it does NOT store received data.
 /// Data is stored in `Received` alongside the Transport.
 ///
+/// UDP transports send through a channel to the socket's writer task.
 /// When the socket is dropped by the pool (e.g., environment change),
-/// the Weak reference fails and `send()` returns an error.
+/// the channel closes and `send()` returns an error.
 ///
 /// # Examples
 ///
 /// ```rust,no_run
+/// use bytes::Bytes;
 /// use rustp2p_core::endpoint::Transport;
 ///
 /// # async fn example(transport: Transport) -> std::io::Result<()> {
-/// transport.send(b"hello").await?;
+/// transport.send(Bytes::from_static(b"hello")).await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -33,44 +34,52 @@ pub struct Transport {
 
 #[derive(Clone)]
 enum TransportInner {
-    Udp(Weak<UdpSocket>),
-    Tcp(Weak<TcpConnection>),
+    Udp(mpsc::Sender<(Bytes, SocketAddr)>),
+    Tcp(mpsc::Sender<Bytes>),
 }
 
 impl Transport {
     /// Creates a UDP transport.
-    pub(crate) fn udp(weak: Weak<UdpSocket>, local_addr: SocketAddr, peer_addr: SocketAddr) -> Self {
+    pub(crate) fn udp(
+        write_tx: mpsc::Sender<(Bytes, SocketAddr)>,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+    ) -> Self {
         Self {
-            inner: TransportInner::Udp(weak),
+            inner: TransportInner::Udp(write_tx),
             local_addr,
             peer_addr,
         }
     }
 
     /// Creates a TCP transport.
-    pub(crate) fn tcp(weak: Weak<TcpConnection>, local_addr: SocketAddr, peer_addr: SocketAddr) -> Self {
+    pub(crate) fn tcp(
+        write_tx: mpsc::Sender<Bytes>,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+    ) -> Self {
         Self {
-            inner: TransportInner::Tcp(weak),
+            inner: TransportInner::Tcp(write_tx),
             local_addr,
             peer_addr,
         }
     }
 
     /// Send data to the peer this transport connects to.
-    pub async fn send(&self, data: &[u8]) -> io::Result<()> {
+    pub async fn send(&self, data: Bytes) -> io::Result<()> {
         match &self.inner {
-            TransportInner::Udp(weak) => {
-                let socket = weak
-                    .upgrade()
-                    .ok_or_else(|| io::Error::other("UDP socket dropped"))?;
-                socket.send_to(data, self.peer_addr).await?;
+            TransportInner::Udp(write_tx) => {
+                write_tx
+                    .send((data, self.peer_addr))
+                    .await
+                    .map_err(|_| io::Error::other("UDP socket dropped"))?;
                 Ok(())
             }
-            TransportInner::Tcp(weak) => {
-                let conn = weak
-                    .upgrade()
-                    .ok_or_else(|| io::Error::other("TCP connection dropped"))?;
-                conn.send(data).await
+            TransportInner::Tcp(write_tx) => {
+                write_tx
+                    .send(data)
+                    .await
+                    .map_err(|_| io::Error::other("TCP connection closed"))
             }
         }
     }

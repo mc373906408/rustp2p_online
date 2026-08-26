@@ -26,13 +26,13 @@ struct UdpEntry {
 /// A TCP connection with Encoder for writing.
 pub struct TcpConnection {
     pub peer_addr: SocketAddr,
-    write_tx: mpsc::Sender<Vec<u8>>,
+    write_tx: mpsc::Sender<Bytes>,
 }
 
 impl TcpConnection {
     pub async fn send(&self, data: &[u8]) -> io::Result<()> {
         self.write_tx
-            .send(data.to_vec())
+            .send(Bytes::copy_from_slice(data))
             .await
             .map_err(|_| io::Error::other("TCP connection closed"))
     }
@@ -59,12 +59,18 @@ impl SocketPool {
         let (global_shutdown, _) = broadcast::channel(4);
         let socket = Arc::new(socket);
 
+        let (write_tx, write_rx) = mpsc::channel::<(Bytes, SocketAddr)>(64);
         let mut shutdown_rx = global_shutdown.subscribe();
-        let socket_weak = Arc::downgrade(&socket);
         let data_tx_clone = data_tx.clone();
         let s = socket.clone();
         tokio::spawn(async move {
-            Self::run_udp_reader(s, socket_weak, data_tx_clone, &mut shutdown_rx).await;
+            Self::run_udp_reader(s, write_tx, data_tx_clone, &mut shutdown_rx).await;
+        });
+
+        let mut shutdown_rx = global_shutdown.subscribe();
+        let s = socket.clone();
+        tokio::spawn(async move {
+            Self::run_udp_writer(s, write_rx, &mut shutdown_rx).await;
         });
 
         let entry = UdpEntry {
@@ -89,15 +95,21 @@ impl SocketPool {
     pub async fn add_assistant_udp(&self, socket: UdpSocket) -> Weak<UdpSocket> {
         let socket = Arc::new(socket);
         let weak = Arc::downgrade(&socket);
-        let socket_weak = weak.clone();
 
         // Per-socket shutdown for this assistant socket
         let (socket_shutdown, mut socket_shutdown_rx) = broadcast::channel(4);
+        let (write_tx, write_rx) = mpsc::channel::<(Bytes, SocketAddr)>(64);
         let data_tx = self.data_tx.clone();
         let s = socket.clone();
 
         tokio::spawn(async move {
-            Self::run_udp_reader(s, socket_weak, data_tx, &mut socket_shutdown_rx).await;
+            Self::run_udp_reader(s, write_tx, data_tx, &mut socket_shutdown_rx).await;
+        });
+
+        let mut writer_shutdown_rx = socket_shutdown.subscribe();
+        let s = socket.clone();
+        tokio::spawn(async move {
+            Self::run_udp_writer(s, write_rx, &mut writer_shutdown_rx).await;
         });
 
         let entry = UdpEntry {
@@ -136,7 +148,7 @@ impl SocketPool {
             .local_addr()
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
         let (mut decoder, _encoder) = self.init_codec.codec(peer_addr)?;
-        let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (write_tx, mut write_rx) = mpsc::channel::<Bytes>(64);
         let data_tx = self.data_tx.clone();
         let mut shutdown_rx = self.global_shutdown.subscribe();
 
@@ -145,11 +157,10 @@ impl SocketPool {
             peer_addr,
             write_tx,
         });
-        let conn_weak = Arc::downgrade(&conn);
+        let conn_write_tx = conn.write_tx.clone();
 
         // Read loop using Decoder
         let pool_for_read = self.clone();
-        let conn_weak_for_read = conn_weak.clone();
         tokio::spawn(async move {
             let mut read = read_half;
             let mut data_buf = vec![0u8; 65536];
@@ -159,7 +170,7 @@ impl SocketPool {
                         match result {
                             Ok(len) => {
                                 let data = Bytes::copy_from_slice(&data_buf[..len]);
-                                let route = super::transport::Transport::tcp(conn_weak_for_read.clone(), local_addr, peer_addr);
+                                let route = super::transport::Transport::tcp(conn_write_tx.clone(), local_addr, peer_addr);
                                 let _ = data_tx.send((route, data)).await;
                             }
                             Err(e) => {
@@ -334,7 +345,7 @@ impl SocketPool {
 
     async fn run_udp_reader(
         socket: Arc<UdpSocket>,
-        weak: Weak<UdpSocket>,
+        write_tx: mpsc::Sender<(Bytes, SocketAddr)>,
         data_tx: mpsc::Sender<(super::transport::Transport, Bytes)>,
         shutdown_rx: &mut broadcast::Receiver<()>,
     ) {
@@ -349,7 +360,7 @@ impl SocketPool {
                         Ok((0, _)) => break,
                         Ok((len, addr)) => {
                             let data = Bytes::copy_from_slice(&buf[..len]);
-                            let route = super::transport::Transport::udp(weak.clone(), local_addr, addr);
+                            let route = super::transport::Transport::udp(write_tx.clone(), local_addr, addr);
                             if data_tx.send((route, data)).await.is_err() {
                                 break;
                             }
@@ -366,7 +377,35 @@ impl SocketPool {
                 }
             }
         }
-        // Keep socket alive until reader exits
+    }
+
+    /// Writer task for a UDP socket: drains `(data, peer)` messages from the
+    /// channel and sends them through the socket. Exits when the channel
+    /// closes or the socket is shut down.
+    async fn run_udp_writer(
+        socket: Arc<UdpSocket>,
+        mut write_rx: mpsc::Receiver<(Bytes, SocketAddr)>,
+        shutdown_rx: &mut broadcast::Receiver<()>,
+    ) {
+        loop {
+            tokio::select! {
+                msg = write_rx.recv() => {
+                    match msg {
+                        Some((data, addr)) => {
+                            if let Err(e) = socket.send_to(&data, addr).await {
+                                log::warn!("UDP send error: {e}");
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    log::debug!("UDP write task shutting down");
+                    break;
+                }
+            }
+        }
+        // Keep socket alive until writer exits
         drop(socket);
     }
 }

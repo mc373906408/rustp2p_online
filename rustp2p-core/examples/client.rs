@@ -229,7 +229,7 @@ impl ContextHandler {
                 request.extend_from_slice(nat_data.as_bytes());
                 received
                     .transport
-                    .send(request.freeze().as_ref())
+                    .send(request.freeze())
                     .await
                     .ok();
 
@@ -273,7 +273,7 @@ impl ContextHandler {
                 request.put_u32(src_id);
                 received
                     .transport
-                    .send(request.freeze().as_ref())
+                    .send(request.freeze())
                     .await
                     .ok();
             }
