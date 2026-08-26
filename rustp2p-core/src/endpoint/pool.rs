@@ -8,19 +8,11 @@ use tokio::sync::{broadcast, mpsc, RwLock};
 
 use crate::endpoint::codec::InitCodec;
 
-/// Socket role in the pool.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum SocketRole {
-    Main,
-    Assistant,
-}
-
-/// A managed UDP socket entry with its own shutdown signal.
+/// A managed assistant UDP socket entry with its own shutdown signal.
 struct UdpEntry {
     socket: Arc<UdpSocket>,
-    role: SocketRole,
-    /// Per-socket shutdown sender for assistant sockets. None for main socket.
-    _shutdown: Option<broadcast::Sender<()>>,
+    /// Per-socket shutdown sender for the assistant socket.
+    _shutdown: broadcast::Sender<()>,
 }
 
 /// A TCP connection with Encoder for writing.
@@ -39,8 +31,14 @@ impl TcpConnection {
 }
 
 /// A shared pool of sockets. Owns all Arcs.
+///
+/// The main IPv4 and IPv6 UDP sockets are fixed at construction time and
+/// never change, so they need no lock. Assistant UDP sockets are created and
+/// removed dynamically (e.g. symmetric NAT probing) and live in a locked list.
 pub struct SocketPool {
-    udp_sockets: RwLock<Vec<UdpEntry>>,
+    main_udp_v4: Arc<UdpSocket>,
+    main_udp_v6: Arc<UdpSocket>,
+    assistant_udp: RwLock<Vec<UdpEntry>>,
     tcp_conns: RwLock<HashMap<SocketAddr, Arc<TcpConnection>>>,
     data_tx: mpsc::Sender<(super::transport::Transport, Bytes)>,
     /// Global shutdown - kills ALL tasks (main + sub)
@@ -50,37 +48,24 @@ pub struct SocketPool {
 }
 
 impl SocketPool {
-    /// Create a pool from a UDP socket.
+    /// Create a pool from main IPv4 and IPv6 UDP sockets.
     pub fn new(
-        socket: UdpSocket,
+        main_udp_v4: UdpSocket,
+        main_udp_v6: UdpSocket,
         init_codec: Box<dyn InitCodec>,
     ) -> (Self, mpsc::Receiver<(super::transport::Transport, Bytes)>) {
         let (data_tx, data_rx) = mpsc::channel(512);
         let (global_shutdown, _) = broadcast::channel(4);
-        let socket = Arc::new(socket);
 
-        let (write_tx, write_rx) = mpsc::channel::<(Bytes, SocketAddr)>(64);
-        let mut shutdown_rx = global_shutdown.subscribe();
-        let data_tx_clone = data_tx.clone();
-        let s = socket.clone();
-        tokio::spawn(async move {
-            Self::run_udp_reader(s, write_tx, data_tx_clone, &mut shutdown_rx).await;
-        });
-
-        let mut shutdown_rx = global_shutdown.subscribe();
-        let s = socket.clone();
-        tokio::spawn(async move {
-            Self::run_udp_writer(s, write_rx, &mut shutdown_rx).await;
-        });
-
-        let entry = UdpEntry {
-            socket,
-            role: SocketRole::Main,
-            _shutdown: None,
-        };
+        let main_udp_v4 = Arc::new(main_udp_v4);
+        let main_udp_v6 = Arc::new(main_udp_v6);
+        Self::spawn_udp_tasks(main_udp_v4.clone(), &data_tx, &global_shutdown);
+        Self::spawn_udp_tasks(main_udp_v6.clone(), &data_tx, &global_shutdown);
 
         let pool = Self {
-            udp_sockets: RwLock::new(vec![entry]),
+            main_udp_v4,
+            main_udp_v6,
+            assistant_udp: RwLock::new(Vec::new()),
             tcp_conns: RwLock::new(HashMap::new()),
             data_tx,
             global_shutdown,
@@ -88,6 +73,30 @@ impl SocketPool {
             connect_lock: tokio::sync::Mutex::new(()),
         };
         (pool, data_rx)
+    }
+
+    /// Spawn the read and write tasks for one UDP socket.
+    fn spawn_udp_tasks(
+        socket: Arc<UdpSocket>,
+        data_tx: &mpsc::Sender<(super::transport::Transport, Bytes)>,
+        global_shutdown: &broadcast::Sender<()>,
+    ) {
+        let (write_tx, write_rx) = mpsc::channel::<(Bytes, SocketAddr)>(64);
+
+        let mut global_shutdown_rx = global_shutdown.subscribe();
+        let mut socket_shutdown_rx = global_shutdown.subscribe();
+        let data_tx_clone = data_tx.clone();
+        let s = socket.clone();
+        tokio::spawn(async move {
+            Self::run_udp_reader(s, write_tx, data_tx_clone, &mut global_shutdown_rx, &mut socket_shutdown_rx).await;
+        });
+
+        let mut global_shutdown_rx = global_shutdown.subscribe();
+        let mut socket_shutdown_rx = global_shutdown.subscribe();
+        let s = socket.clone();
+        tokio::spawn(async move {
+            Self::run_udp_writer(s, write_rx, &mut global_shutdown_rx, &mut socket_shutdown_rx).await;
+        });
     }
 
     /// Add an assistant UDP socket (for symmetric NAT probing).
@@ -100,25 +109,39 @@ impl SocketPool {
         let (socket_shutdown, mut socket_shutdown_rx) = broadcast::channel(4);
         let (write_tx, write_rx) = mpsc::channel::<(Bytes, SocketAddr)>(64);
         let data_tx = self.data_tx.clone();
+        let mut global_shutdown_rx = self.global_shutdown.subscribe();
         let s = socket.clone();
 
         tokio::spawn(async move {
-            Self::run_udp_reader(s, write_tx, data_tx, &mut socket_shutdown_rx).await;
+            Self::run_udp_reader(
+                s,
+                write_tx,
+                data_tx,
+                &mut global_shutdown_rx,
+                &mut socket_shutdown_rx,
+            )
+            .await;
         });
 
         let mut writer_shutdown_rx = socket_shutdown.subscribe();
+        let mut writer_global_shutdown_rx = self.global_shutdown.subscribe();
         let s = socket.clone();
         tokio::spawn(async move {
-            Self::run_udp_writer(s, write_rx, &mut writer_shutdown_rx).await;
+            Self::run_udp_writer(
+                s,
+                write_rx,
+                &mut writer_global_shutdown_rx,
+                &mut writer_shutdown_rx,
+            )
+            .await;
         });
 
         let entry = UdpEntry {
             socket,
-            role: SocketRole::Assistant,
-            _shutdown: Some(socket_shutdown),
+            _shutdown: socket_shutdown,
         };
 
-        let mut sockets = self.udp_sockets.write().await;
+        let mut sockets = self.assistant_udp.write().await;
         sockets.push(entry);
         drop(sockets);
 
@@ -127,9 +150,9 @@ impl SocketPool {
 
     /// Clean all assistant UDP sockets and cancel their reader tasks.
     pub async fn clean_assistant_udp(&self) {
-        let mut sockets = self.udp_sockets.write().await;
+        let mut sockets = self.assistant_udp.write().await;
         // Dropping UdpEntry drops _shutdown Sender, reader task exits.
-        sockets.retain(|e| e.role == SocketRole::Main);
+        sockets.clear();
     }
 
     /// Remove a TCP connection from the pool by peer address.
@@ -225,31 +248,30 @@ impl SocketPool {
 
     /// Send data through ALL assistant UDP sockets to a specific address.
     pub async fn send_via_assistants(&self, buf: &[u8], addr: SocketAddr) {
-        let sockets = self.udp_sockets.read().await;
+        let sockets = self.assistant_udp.read().await;
         for entry in sockets.iter() {
-            if entry.role == SocketRole::Assistant {
-                let _ = entry.socket.try_send_to(buf, addr);
-            }
+            let _ = entry.socket.try_send_to(buf, addr);
         }
     }
 
-    /// Send data to an address via the main UDP socket.
+    /// Send data to an address via the matching family main UDP socket.
     pub async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<()> {
-        let sockets = self.udp_sockets.read().await;
-        let main_socket = sockets
-            .iter()
-            .find(|e| e.role == SocketRole::Main)
-            .ok_or_else(|| io::Error::other("no main UDP socket"))?;
-        main_socket
-            .socket
+        let socket = if addr.is_ipv4() {
+            &self.main_udp_v4
+        } else {
+            &self.main_udp_v6
+        };
+        socket
             .try_send_to(buf, addr)
             .map(|_| ())
             .map_err(|e| io::Error::other(format!("send failed: {e}")))
     }
 
-    /// Send data through ALL UDP sockets (main + assistant) to a specific address.
+    /// Send data through ALL UDP sockets (main v4/v6 + assistant) to a specific address.
     pub async fn try_send_via_all(&self, buf: &[u8], addr: SocketAddr) {
-        let sockets = self.udp_sockets.read().await;
+        let _ = self.main_udp_v4.try_send_to(buf, addr);
+        let _ = self.main_udp_v6.try_send_to(buf, addr);
+        let sockets = self.assistant_udp.read().await;
         for entry in sockets.iter() {
             let _ = entry.socket.try_send_to(buf, addr);
         }
@@ -265,15 +287,9 @@ impl SocketPool {
         self.global_shutdown.subscribe()
     }
 
-    /// Get local address of first UDP socket.
+    /// Get local address of the main IPv4 UDP socket.
     pub async fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.udp_sockets
-            .read()
-            .await
-            .first()
-            .ok_or_else(|| io::Error::other("no UDP sockets"))?
-            .socket
-            .local_addr()
+        self.main_udp_v4.local_addr()
     }
 
     /// Find a TCP connection by peer address.
@@ -304,50 +320,49 @@ impl SocketPool {
         self.tcp_conns.read().await.values().cloned().collect()
     }
 
-    /// Get a UDP socket by index.
+    /// Get a UDP socket by index: 0 = main IPv4, 1 = main IPv6, 2+ = assistants.
     pub async fn udp_socket(&self, index: usize) -> Option<Arc<UdpSocket>> {
-        self.udp_sockets
-            .read()
-            .await
-            .get(index)
-            .map(|e| e.socket.clone())
+        match index {
+            0 => Some(self.main_udp_v4.clone()),
+            1 => Some(self.main_udp_v6.clone()),
+            _ => self
+                .assistant_udp
+                .read()
+                .await
+                .get(index - 2)
+                .map(|e| e.socket.clone()),
+        }
     }
 
-    /// Get all UDP sockets.
+    /// Get all UDP sockets: main IPv4, main IPv6, then assistants.
     pub async fn udp_sockets(&self) -> Vec<Arc<UdpSocket>> {
-        self.udp_sockets
-            .read()
-            .await
-            .iter()
-            .map(|e| e.socket.clone())
-            .collect()
+        let mut sockets = vec![self.main_udp_v4.clone(), self.main_udp_v6.clone()];
+        sockets.extend(
+            self.assistant_udp
+                .read()
+                .await
+                .iter()
+                .map(|e| e.socket.clone()),
+        );
+        sockets
     }
 
     /// Get the number of assistant sockets.
     pub async fn assistant_count(&self) -> usize {
-        self.udp_sockets
-            .read()
-            .await
-            .iter()
-            .filter(|e| e.role == SocketRole::Assistant)
-            .count()
+        self.assistant_udp.read().await.len()
     }
 
-    /// Get the main UDP socket.
+    /// Get the main IPv4 UDP socket.
     pub async fn main_socket(&self) -> Option<Arc<UdpSocket>> {
-        self.udp_sockets
-            .read()
-            .await
-            .iter()
-            .find(|e| e.role == SocketRole::Main)
-            .map(|e| e.socket.clone())
+        Some(self.main_udp_v4.clone())
     }
 
     async fn run_udp_reader(
         socket: Arc<UdpSocket>,
         write_tx: mpsc::Sender<(Bytes, SocketAddr)>,
         data_tx: mpsc::Sender<(super::transport::Transport, Bytes)>,
-        shutdown_rx: &mut broadcast::Receiver<()>,
+        global_shutdown_rx: &mut broadcast::Receiver<()>,
+        socket_shutdown_rx: &mut broadcast::Receiver<()>,
     ) {
         let mut buf = [0u8; 65536];
         let local_addr = socket
@@ -371,8 +386,12 @@ impl SocketPool {
                         }
                     }
                 }
-                _ = shutdown_rx.recv() => {
-                    log::debug!("UDP read task shutting down");
+                _ = global_shutdown_rx.recv() => {
+                    log::debug!("UDP read task shutting down (global)");
+                    break;
+                }
+                _ = socket_shutdown_rx.recv() => {
+                    log::debug!("UDP read task shutting down (socket)");
                     break;
                 }
             }
@@ -381,11 +400,12 @@ impl SocketPool {
 
     /// Writer task for a UDP socket: drains `(data, peer)` messages from the
     /// channel and sends them through the socket. Exits when the channel
-    /// closes or the socket is shut down.
+    /// closes or either shutdown signal fires.
     async fn run_udp_writer(
         socket: Arc<UdpSocket>,
         mut write_rx: mpsc::Receiver<(Bytes, SocketAddr)>,
-        shutdown_rx: &mut broadcast::Receiver<()>,
+        global_shutdown_rx: &mut broadcast::Receiver<()>,
+        socket_shutdown_rx: &mut broadcast::Receiver<()>,
     ) {
         loop {
             tokio::select! {
@@ -399,8 +419,12 @@ impl SocketPool {
                         None => break,
                     }
                 }
-                _ = shutdown_rx.recv() => {
-                    log::debug!("UDP write task shutting down");
+                _ = global_shutdown_rx.recv() => {
+                    log::debug!("UDP write task shutting down (global)");
+                    break;
+                }
+                _ = socket_shutdown_rx.recv() => {
+                    log::debug!("UDP write task shutting down (socket)");
                     break;
                 }
             }

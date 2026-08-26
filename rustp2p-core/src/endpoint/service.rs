@@ -55,9 +55,8 @@ impl EndPoint {
         let mut data_rx_opt = None;
 
         if let Some(port) = config.udp_port {
-            let addr = format!("0.0.0.0:{port}");
-            let socket = UdpSocket::bind(&addr).await?;
-            let (pool, data_rx) = SocketPool::new(socket, codec.clone());
+            let (main_v4, main_v6) = bind_main_udp(port).await?;
+            let (pool, data_rx) = SocketPool::new(main_v4, main_v6, codec.clone());
             pool_opt = Some(Arc::new(pool));
             data_rx_opt = Some(data_rx);
         }
@@ -78,8 +77,8 @@ impl EndPoint {
         let (pool, data_rx) = match pool_opt {
             Some(p) => (p, data_rx_opt.unwrap()),
             None => {
-                let socket = UdpSocket::bind("0.0.0.0:0").await?;
-                let (pool, data_rx) = SocketPool::new(socket, codec.clone());
+                let (main_v4, main_v6) = bind_main_udp(0).await?;
+                let (pool, data_rx) = SocketPool::new(main_v4, main_v6, codec.clone());
                 (Arc::new(pool), data_rx)
             }
         };
@@ -124,10 +123,21 @@ impl EndPoint {
     }
 
     /// Creates an endpoint from an existing UDP socket.
+    ///
+    /// The given socket becomes the main socket of its address family; the
+    /// other family's main socket is bound automatically on the same port.
     pub async fn from_socket(socket: UdpSocket) -> io::Result<Self> {
+        let local = socket.local_addr()?;
+        let (main_v4, main_v6) = if local.is_ipv4() {
+            let v6 = bind_udp_v6(local.port())?;
+            (socket, v6)
+        } else {
+            let v4 = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], local.port()))).await?;
+            (v4, socket)
+        };
         let codec: Box<dyn crate::endpoint::codec::InitCodec> =
             Box::new(crate::endpoint::codec::LengthPrefixedInitCodec);
-        let (pool, data_rx) = SocketPool::new(socket, codec);
+        let (pool, data_rx) = SocketPool::new(main_v4, main_v6, codec);
         Ok(Self {
             pool: Arc::new(pool),
             data_rx,
@@ -278,6 +288,23 @@ impl std::fmt::Debug for EndPoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EndPoint").finish_non_exhaustive()
     }
+}
+
+/// Bind the main UDP sockets: IPv4 on `0.0.0.0:port` and an IPv6-only socket
+/// on `[::]:port`, sharing the requested port.
+async fn bind_main_udp(port: u16) -> io::Result<(UdpSocket, UdpSocket)> {
+    let main_v4 = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
+    let main_v6 = bind_udp_v6(port)?;
+    Ok((main_v4, main_v6))
+}
+
+/// Bind an IPv6-only UDP socket on `[::]:port`.
+///
+/// v6-only so a v4 socket bound to the same port does not conflict.
+fn bind_udp_v6(port: u16) -> io::Result<UdpSocket> {
+    let socket = crate::socket::bind_udp_ops(format!("[::]:{port}").parse().unwrap(), true, None)?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(std_socket)
 }
 
 impl Drop for EndPoint {
