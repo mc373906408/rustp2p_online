@@ -9,10 +9,14 @@
 //! use rustp2p_core::route_table::{RouteKey, Protocol};
 //!
 //! # fn example() {
-//! // Create a RouteKey from protocol and address
-//! let key = RouteKey::new(Protocol::UDP, "127.0.0.1:3000".parse().unwrap());
+//! // Create a RouteKey from protocol and addresses
+//! let key = RouteKey::new(
+//!     Protocol::UDP,
+//!     "127.0.0.1:2000".parse().unwrap(),
+//!     "127.0.0.1:3000".parse().unwrap(),
+//! );
 //! assert!(key.protocol().is_udp());
-//! assert_eq!(key.addr().port(), 3000);
+//! assert_eq!(key.peer_addr().port(), 3000);
 //! # }
 //! ```
 
@@ -30,7 +34,7 @@ pub const DEFAULT_RTT: u32 = 9999;
 /// Identifies a specific route to a peer.
 ///
 /// `RouteKey` uniquely identifies a path by combining the
-/// protocol (UDP/TCP) and remote address.
+/// protocol (UDP/TCP), local (socket) address and remote address.
 ///
 /// # Examples
 ///
@@ -38,37 +42,48 @@ pub const DEFAULT_RTT: u32 = 9999;
 /// use rustp2p_core::route_table::{RouteKey, Protocol};
 ///
 /// # fn example() {
-/// // Create from protocol and address
-/// let key = RouteKey::new(Protocol::UDP, "127.0.0.1:3000".parse().unwrap());
+/// // Create from protocol and addresses
+/// let key = RouteKey::new(
+///     Protocol::UDP,
+///     "127.0.0.1:2000".parse().unwrap(),
+///     "127.0.0.1:3000".parse().unwrap(),
+/// );
 ///
 /// // Or from a Transport
-/// // let key = RouteKey::from_transport(&transport);
+/// // let key = transport.route_key();
 /// # }
 /// ```
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug)]
 pub struct RouteKey {
     protocol: Protocol,
-    addr: SocketAddr,
+    local_addr: SocketAddr,
+    peer_addr: SocketAddr,
 }
 impl Default for RouteKey {
     fn default() -> Self {
         Self {
             protocol: Protocol::TCP,
-            addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+            local_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+            peer_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
         }
     }
 }
 impl RouteKey {
-    /// Creates a new RouteKey from protocol and address.
-    pub const fn new(protocol: Protocol, addr: SocketAddr) -> Self {
-        Self { protocol, addr }
+    /// Creates a new RouteKey from protocol, local and remote addresses.
+    pub const fn new(protocol: Protocol, local_addr: SocketAddr, peer_addr: SocketAddr) -> Self {
+        Self {
+            protocol,
+            local_addr,
+            peer_addr,
+        }
     }
 
     /// Creates a RouteKey from a Transport handle.
     pub fn from_transport(transport: &Transport) -> Self {
         Self {
             protocol: transport.protocol(),
-            addr: transport.remote_addr(),
+            local_addr: transport.local_addr(),
+            peer_addr: transport.remote_addr(),
         }
     }
 
@@ -78,10 +93,16 @@ impl RouteKey {
         self.protocol
     }
 
-    /// Returns the remote socket address.
+    /// Returns the local (socket) address.
     #[inline]
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Returns the remote peer address.
+    #[inline]
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr
     }
 }
 
@@ -125,7 +146,7 @@ impl Protocol {
 impl fmt::Display for RouteKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let protocol = self.protocol();
-        write!(f, "{}://{}", protocol, self.addr())
+        write!(f, "{}://{}", protocol, self.peer_addr())
     }
 }
 

@@ -1142,7 +1142,11 @@ mod tests {
             .unwrap();
         transport.confirm_route(
             PeerId::from("node-b"),
-            RouteKey::new(Protocol::UDP, "127.0.0.1:9".parse().unwrap()),
+            RouteKey::new(
+                Protocol::UDP,
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:9".parse().unwrap(),
+            ),
             0,
         );
         let protocol = ProtocolLayer::new(

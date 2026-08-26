@@ -2,7 +2,7 @@ use bytes::{BufMut, BytesMut};
 use clap::Parser;
 use env_logger::Env;
 use rustp2p_core::endpoint::{Config, EndPoint, Sender};
-use rustp2p_core::route_table::{RouteKey, RouteTable};
+use rustp2p_core::route_table::RouteTable;
 
 /*Demo Protocol
    0                                            15                                              31
@@ -66,7 +66,7 @@ async fn handler(
 ) {
     let data = &received.data;
     let addr = received.transport.remote_addr();
-    let route_key = RouteKey::from_transport(&received.transport);
+    let route_key = received.transport.route_key();
 
     if data.len() < HEAD_LEN {
         log::warn!("invalid protocol {:?}", &data[..]);
@@ -101,13 +101,13 @@ async fn handler(
                 )
                 .unwrap();
                 response.extend_from_slice(json.as_bytes());
-                let peer_addr = peer_route.route_key().addr();
+                let peer_addr = peer_route.route_key().peer_addr();
                 let _ = sender.send_to(response.freeze().as_ref(), peer_addr).await;
             }
         }
         PUNCH_START_1 | PUNCH_START_2 => match route_table.get_route_by_id(&dest_id) {
             Ok(route) => {
-                let peer_addr = route.route_key().addr();
+                let peer_addr = route.route_key().peer_addr();
                 let _ = sender.send_to(data.as_ref(), peer_addr).await;
             }
             Err(e) => {

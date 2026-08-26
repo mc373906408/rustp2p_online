@@ -4,7 +4,7 @@ use std::sync::Weak;
 use tokio::net::UdpSocket;
 
 use crate::endpoint::pool::TcpConnection;
-use crate::route_table::Protocol;
+use crate::route_table::{Protocol, RouteKey};
 
 /// A transport handle to a peer, holding a Weak reference to the socket.
 ///
@@ -27,7 +27,8 @@ use crate::route_table::Protocol;
 #[derive(Clone)]
 pub struct Transport {
     inner: TransportInner,
-    addr: SocketAddr,
+    local_addr: SocketAddr,
+    peer_addr: SocketAddr,
 }
 
 #[derive(Clone)]
@@ -38,18 +39,20 @@ enum TransportInner {
 
 impl Transport {
     /// Creates a UDP transport.
-    pub(crate) fn udp(weak: Weak<UdpSocket>, addr: SocketAddr) -> Self {
+    pub(crate) fn udp(weak: Weak<UdpSocket>, local_addr: SocketAddr, peer_addr: SocketAddr) -> Self {
         Self {
             inner: TransportInner::Udp(weak),
-            addr,
+            local_addr,
+            peer_addr,
         }
     }
 
     /// Creates a TCP transport.
-    pub(crate) fn tcp(weak: Weak<TcpConnection>, addr: SocketAddr) -> Self {
+    pub(crate) fn tcp(weak: Weak<TcpConnection>, local_addr: SocketAddr, peer_addr: SocketAddr) -> Self {
         Self {
             inner: TransportInner::Tcp(weak),
-            addr,
+            local_addr,
+            peer_addr,
         }
     }
 
@@ -60,7 +63,7 @@ impl Transport {
                 let socket = weak
                     .upgrade()
                     .ok_or_else(|| io::Error::other("UDP socket dropped"))?;
-                socket.send_to(data, self.addr).await?;
+                socket.send_to(data, self.peer_addr).await?;
                 Ok(())
             }
             TransportInner::Tcp(weak) => {
@@ -82,7 +85,17 @@ impl Transport {
 
     /// Returns the remote address.
     pub fn remote_addr(&self) -> SocketAddr {
-        self.addr
+        self.peer_addr
+    }
+
+    /// Returns the local (socket) address.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Returns the `RouteKey` identifying this transport's route.
+    pub fn route_key(&self) -> RouteKey {
+        RouteKey::new(self.protocol(), self.local_addr, self.peer_addr)
     }
 
     pub fn is_udp(&self) -> bool {
@@ -98,7 +111,8 @@ impl std::fmt::Debug for Transport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Transport")
             .field("protocol", &self.protocol())
-            .field("addr", &self.addr)
+            .field("local_addr", &self.local_addr)
+            .field("peer_addr", &self.peer_addr)
             .finish()
     }
 }

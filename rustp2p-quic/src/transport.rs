@@ -120,6 +120,10 @@ struct CoreTransportLayer {
     sender: CoreSender,
     puncher: rustp2p_core::punch::Puncher,
     local_addr: SocketAddr,
+    // Raw socket local address (may be 0.0.0.0/:: when bound to INADDR_ANY),
+    // as reported by the core socket itself. Used to build RouteKeys that
+    // match the ones produced from received packets.
+    raw_local_addr: SocketAddr,
     local_tcp_port: u16,
     raw_tx: flume::Sender<RawTransportPacket>,
     routes: parking_lot::RwLock<Option<RouteTable<PeerId>>>,
@@ -157,13 +161,15 @@ impl CoreTransportLayer {
         let sender = endpoint.sender();
         let puncher = endpoint.puncher();
         let local_tcp_port = endpoint.local_tcp_port();
-        let local_addr = normalize_local_addr(endpoint.local_addr().await?, config.bind_addr);
+        let raw_local_addr = endpoint.local_addr().await?;
+        let local_addr = normalize_local_addr(raw_local_addr, config.bind_addr);
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let layer = Arc::new(Self {
             sender,
             puncher,
             local_addr,
+            raw_local_addr,
             local_tcp_port,
             raw_tx,
             routes: parking_lot::RwLock::new(None),
@@ -191,6 +197,10 @@ impl CoreTransportLayer {
 
     fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    fn raw_local_addr(&self) -> SocketAddr {
+        self.raw_local_addr
     }
 
     fn local_tcp_addr(&self) -> Option<SocketAddr> {
@@ -246,7 +256,7 @@ impl CoreTransportLayer {
                         let Some(received) = received else {
                             break;
                         };
-                        let route_key = RouteKey::from_transport(&received.transport);
+                        let route_key = received.transport.route_key();
                         // Store the send handle for this core transport, but do not add
                         // a PeerId route here. Only the protocol layer can confirm that
                         // a route is usable for outbound peer traffic.
@@ -320,9 +330,9 @@ impl CoreTransportLayer {
             return transport.send(data).await;
         }
         if route_key.protocol().is_tcp() {
-            self.sender.write_to(data, route_key.addr()).await
+            self.sender.write_to(data, route_key.peer_addr()).await
         } else {
-            self.sender.send_to(data, route_key.addr()).await
+            self.sender.send_to(data, route_key.peer_addr()).await
         }
     }
 }
@@ -360,6 +370,12 @@ impl TransportLayer {
 
     pub(crate) fn local_addr(&self) -> SocketAddr {
         self.core.local_addr()
+    }
+
+    /// Raw core socket local address, matching the local side of RouteKeys
+    /// built from received packets.
+    pub(crate) fn raw_local_addr(&self) -> SocketAddr {
+        self.core.raw_local_addr()
     }
 
     pub(crate) fn local_tcp_addr(&self) -> Option<SocketAddr> {
@@ -515,8 +531,8 @@ impl TransportLayer {
             // A confirmed direct route means no relay is needed.
             // Clear any stale relay_hint left over from relay discovery.
             peer.relay_hint = None;
-            if !peer.addrs.contains(&route_key.addr()) {
-                peer.addrs.push(route_key.addr());
+            if !peer.addrs.contains(&route_key.peer_addr()) {
+                peer.addrs.push(route_key.peer_addr());
             }
         } else {
             peer.is_direct = false;
@@ -611,6 +627,7 @@ mod tests {
             peer.clone(),
             rustp2p_core::route_table::RouteKey::new(
                 rustp2p_core::route_table::Protocol::UDP,
+                "127.0.0.1:0".parse().unwrap(),
                 "127.0.0.1:1111".parse().unwrap(),
             ),
             1,
@@ -619,6 +636,7 @@ mod tests {
             peer.clone(),
             rustp2p_core::route_table::RouteKey::new(
                 rustp2p_core::route_table::Protocol::TCP,
+                "127.0.0.1:0".parse().unwrap(),
                 "127.0.0.1:2222".parse().unwrap(),
             ),
             1,
@@ -636,6 +654,7 @@ mod tests {
             peer.clone(),
             rustp2p_core::route_table::RouteKey::new(
                 rustp2p_core::route_table::Protocol::UDP,
+                "127.0.0.1:0".parse().unwrap(),
                 "127.0.0.1:3333".parse().unwrap(),
             ),
             0,

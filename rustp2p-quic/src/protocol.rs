@@ -530,7 +530,11 @@ impl ProtocolLayer {
             .send_raw_to_addr(packet.as_bytes(), addr)
             .await?;
         self.pending_hello_routes
-            .insert(RouteKey::new(Protocol::UDP, addr));
+            .insert(RouteKey::new(
+                Protocol::UDP,
+                self.transport.raw_local_addr(),
+                addr,
+            ));
 
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
@@ -763,7 +767,7 @@ impl ProtocolLayer {
                 } else {
                     self.transport.upsert_peer_info(hello.peer);
                 }
-                let _ = self.hello_tx.send_async((route_key.addr(), peer_id)).await;
+                let _ = self.hello_tx.send_async((route_key.peer_addr(), peer_id)).await;
                 self.ingest_route_entries(hello.peers, route_key).await?;
             }
             ProtocolType::IDRouteQuery => {
@@ -1118,7 +1122,7 @@ impl ProtocolLayer {
         // address so Phase-1 port prediction centers on the real port.
         let mut nat_info = nat_info;
         if metric == 0 {
-            if let SocketAddr::V4(addr) = route_key.addr() {
+            if let SocketAddr::V4(addr) = route_key.peer_addr() {
                 let ip = *addr.ip();
                 if !nat_info.public_ips.contains(&ip) {
                     nat_info.public_ips.push(ip);
@@ -1280,7 +1284,7 @@ impl ProtocolLayer {
         // This is the root-cause fix for the 0.0.0.0 address leak. Without
         // this filter, a directly-connected bootstrap node (metric == 0, never
         // relayed) would broadcast 0.0.0.0 in its HelloReply. Because direct
-        // routes only *append* route_key.addr() without ever calling addrs.clear(),
+        // routes only *append* route_key.peer_addr() without ever calling addrs.clear(),
         // the leaked 0.0.0.0 persists in the peer's view. NAT'd nodes discovered
         // first via a relay (metric > 0) are immune because confirm_peer_route
         // calls addrs.clear() on the relay step, wiping the leaked address.
@@ -1326,7 +1330,7 @@ impl ProtocolLayer {
     fn observation_from_route(&self, route_key: RouteKey) -> NatObservation {
         NatObservation {
             observed_protocol: route_key.protocol().into(),
-            observed_addr: route_key.addr(),
+            observed_addr: route_key.peer_addr(),
             observer_peer_id: self.peer_id.clone(),
             observed_at: now_millis(),
         }
@@ -1358,7 +1362,7 @@ impl ProtocolLayer {
         PeerInfo {
             peer_id: src.clone(),
             addrs: if metric == 0 {
-                vec![route_key.addr()]
+                vec![route_key.peer_addr()]
             } else {
                 Vec::new()
             },

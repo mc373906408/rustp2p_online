@@ -132,6 +132,9 @@ impl SocketPool {
         peer_addr: SocketAddr,
     ) -> io::Result<Weak<TcpConnection>> {
         let (read_half, mut write_half) = stream.into_split();
+        let local_addr = read_half
+            .local_addr()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
         let (mut decoder, _encoder) = self.init_codec.codec(peer_addr)?;
         let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(64);
         let data_tx = self.data_tx.clone();
@@ -156,7 +159,7 @@ impl SocketPool {
                         match result {
                             Ok(len) => {
                                 let data = Bytes::copy_from_slice(&data_buf[..len]);
-                                let route = super::transport::Transport::tcp(conn_weak_for_read.clone(), peer_addr);
+                                let route = super::transport::Transport::tcp(conn_weak_for_read.clone(), local_addr, peer_addr);
                                 let _ = data_tx.send((route, data)).await;
                             }
                             Err(e) => {
@@ -336,6 +339,9 @@ impl SocketPool {
         shutdown_rx: &mut broadcast::Receiver<()>,
     ) {
         let mut buf = [0u8; 65536];
+        let local_addr = socket
+            .local_addr()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
         loop {
             tokio::select! {
                 result = socket.recv_from(&mut buf) => {
@@ -343,7 +349,7 @@ impl SocketPool {
                         Ok((0, _)) => break,
                         Ok((len, addr)) => {
                             let data = Bytes::copy_from_slice(&buf[..len]);
-                            let route = super::transport::Transport::udp(weak.clone(), addr);
+                            let route = super::transport::Transport::udp(weak.clone(), local_addr, addr);
                             if data_tx.send((route, data)).await.is_err() {
                                 break;
                             }

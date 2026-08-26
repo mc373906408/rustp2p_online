@@ -11,7 +11,7 @@ use rustp2p_core::endpoint::{Config, EndPoint, Sender};
 use rustp2p_core::idle::IdleRouteManager;
 use rustp2p_core::nat::NatInfo;
 use rustp2p_core::punch::{PunchInfo, PunchModel, Puncher};
-use rustp2p_core::route_table::{RouteKey, RouteTable};
+use rustp2p_core::route_table::RouteTable;
 
 /*Demo Protocol
    0                                            15                                              31
@@ -281,7 +281,7 @@ impl ContextHandler {
                 log::info!("======================== PUNCH_RES ========================");
                 // Punch succeeded (bidirectional), add direct route (metric=0)
                 self.route_table
-                    .add_route(src_id, (RouteKey::from_transport(&received.transport), 0));
+                    .add_route(src_id, (received.transport.route_key(), 0));
             }
             PUBLIC_ADDR_RES => {
                 let public_addr =

@@ -131,7 +131,11 @@ use rustp2p_core::route_table::{Protocol, RouteKey, RouteTable};
 
 fn main() -> std::io::Result<()> {
     let routes: RouteTable<String> = RouteTable::new(LoadBalance::MinHopLowestLatency);
-    let key = RouteKey::new(Protocol::UDP, "127.0.0.1:3000".parse().unwrap());
+    let key = RouteKey::new(
+        Protocol::UDP,
+        "127.0.0.1:2000".parse().unwrap(),
+        "127.0.0.1:3000".parse().unwrap(),
+    );
 
     routes.add_route("peer-a".to_string(), (key, 0));
     let route = routes.get_route_by_id(&"peer-a".to_string())?;
