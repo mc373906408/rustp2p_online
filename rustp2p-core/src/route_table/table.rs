@@ -1,14 +1,33 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::io;
-use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::endpoint::LoadBalance;
 use crate::route_table::{RouteKey, RouteSortKey, DEFAULT_RTT};
-use crossbeam_utils::atomic::AtomicCell;
 use dashmap::DashMap;
+
+/// Process-local monotonic epoch used to encode route activity in whole seconds.
+static ROUTE_TIME_EPOCH: OnceLock<Instant> = OnceLock::new();
+
+#[inline]
+fn route_now_secs() -> usize {
+    let elapsed = ROUTE_TIME_EPOCH
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_secs();
+    usize::try_from(elapsed).unwrap_or(usize::MAX)
+}
+
+#[inline]
+fn route_time_to_instant(seconds: usize) -> Instant {
+    let epoch = *ROUTE_TIME_EPOCH.get_or_init(Instant::now);
+    epoch
+        .checked_add(Duration::from_secs(seconds as u64))
+        .unwrap_or(epoch)
+}
 
 #[derive(Copy, Clone, Debug)]
 pub struct Route {
@@ -71,7 +90,7 @@ impl From<(RouteKey, u8)> for Route {
 }
 
 pub(crate) type RouteTableInner<PeerID> =
-    Arc<DashMap<PeerID, (AtomicUsize, Vec<(Route, AtomicCell<Instant>)>)>>;
+    Arc<DashMap<PeerID, (AtomicUsize, Vec<(Route, AtomicUsize)>)>>;
 pub struct RouteTable<PeerID> {
     pub(crate) route_table: RouteTableInner<PeerID>,
     route_key_table: Arc<DashMap<RouteKey, PeerID>>,
@@ -132,7 +151,7 @@ impl<PeerID: Hash + Eq> RouteTable<PeerID> {
             } else {
                 let len = routes.len();
                 if len != 0 {
-                    let index = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % len;
+                    let index = count.fetch_add(1, Ordering::Relaxed) % len;
                     return Ok(routes[index].0);
                 }
             }
@@ -157,7 +176,7 @@ impl<PeerID: Hash + Eq + Clone> RouteTable<PeerID> {
             let (_, routes) = entry.value();
             for (route, time) in routes {
                 if &route.route_key() == route_key {
-                    time.store(Instant::now());
+                    time.store(route_now_secs(), Ordering::Relaxed);
                     return true;
                 }
             }
@@ -367,23 +386,23 @@ impl<PeerID: Hash + Eq + Clone> RouteTable<PeerID> {
         if self.route_table.is_empty() {
             return None;
         }
-        let mut option: Option<(PeerID, Route, Instant)> = None;
+        let mut option: Option<(PeerID, Route, usize)> = None;
         for entry in self.route_table.iter() {
             let (peer_id, (_, routes)) = (entry.key(), entry.value());
             for (route, time) in routes {
-                let instant = time.load();
-                if let Some((t_peer_id, t_route, t_instant)) = &mut option {
-                    if *t_instant > instant {
+                let timestamp = time.load(Ordering::Relaxed);
+                if let Some((t_peer_id, t_route, t_timestamp)) = &mut option {
+                    if *t_timestamp > timestamp {
                         *t_peer_id = peer_id.clone();
                         *t_route = *route;
-                        *t_instant = instant;
+                        *t_timestamp = timestamp;
                     }
                 } else {
-                    option.replace((peer_id.clone(), *route, instant));
+                    option.replace((peer_id.clone(), *route, timestamp));
                 }
             }
         }
-        option
+        option.map(|(peer_id, route, timestamp)| (peer_id, route, route_time_to_instant(timestamp)))
     }
 }
 impl<PeerID: Hash + Eq + Clone> RouteTable<PeerID> {
@@ -394,7 +413,7 @@ impl<PeerID: Hash + Eq + Clone> RouteTable<PeerID> {
                 let (_, routes) = entry.value();
                 for (x, time) in routes {
                     if x.route_key() == key {
-                        time.store(Instant::now());
+                        time.store(route_now_secs(), Ordering::Relaxed);
                         return true;
                     }
                 }
@@ -417,7 +436,7 @@ impl<PeerID: Hash + Eq + Clone> RouteTable<PeerID> {
                 return false;
             }
             if x.route_key() == key {
-                time.store(Instant::now());
+                time.store(route_now_secs(), Ordering::Relaxed);
                 if only_if_absent {
                     return true;
                 }
@@ -455,7 +474,7 @@ impl<PeerID: Hash + Eq + Clone> RouteTable<PeerID> {
                 self.route_key_table
                     .insert(route.route_key(), peer_id.clone());
             }
-            list.push((route, AtomicCell::new(Instant::now())));
+            list.push((route, AtomicUsize::new(route_now_secs())));
             // Sort after push so the newly added route is included in the
             // ordering. For MinHopLowestLatency this places direct routes
             // (metric 0) ahead of relay routes.
