@@ -55,7 +55,7 @@ impl EndPoint {
         let mut data_rx_opt = None;
 
         if let Some(port) = config.udp_port {
-            let (main_v4, main_v6) = bind_main_udp(port).await?;
+            let (main_v4, main_v6) = bind_main_udp(port, config.enable_ipv6).await?;
             let (pool, data_rx) = SocketPool::new(main_v4, main_v6, codec.clone());
             pool_opt = Some(Arc::new(pool));
             data_rx_opt = Some(data_rx);
@@ -77,7 +77,7 @@ impl EndPoint {
         let (pool, data_rx) = match pool_opt {
             Some(p) => (p, data_rx_opt.unwrap()),
             None => {
-                let (main_v4, main_v6) = bind_main_udp(0).await?;
+                let (main_v4, main_v6) = bind_main_udp(0, config.enable_ipv6).await?;
                 let (pool, data_rx) = SocketPool::new(main_v4, main_v6, codec.clone());
                 (Arc::new(pool), data_rx)
             }
@@ -125,15 +125,22 @@ impl EndPoint {
     /// Creates an endpoint from an existing UDP socket.
     ///
     /// The given socket becomes the main socket of its address family; the
-    /// other family's main socket is bound automatically on the same port.
+    /// other family's main socket is bound automatically on the same port
+    /// when supported.
     pub async fn from_socket(socket: UdpSocket) -> io::Result<Self> {
         let local = socket.local_addr()?;
         let (main_v4, main_v6) = if local.is_ipv4() {
-            let v6 = bind_udp_v6(local.port())?;
+            let v6 = match bind_udp_v6(local.port()) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    log::warn!("IPv6 main socket unavailable, falling back to IPv4 only: {e}");
+                    None
+                }
+            };
             (socket, v6)
         } else {
             let v4 = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], local.port()))).await?;
-            (v4, socket)
+            (v4, Some(socket))
         };
         let codec: Box<dyn crate::endpoint::codec::InitCodec> =
             Box::new(crate::endpoint::codec::LengthPrefixedInitCodec);
@@ -290,12 +297,65 @@ impl std::fmt::Debug for EndPoint {
     }
 }
 
-/// Bind the main UDP sockets: IPv4 on `0.0.0.0:port` and an IPv6-only socket
-/// on `[::]:port`, sharing the requested port.
-async fn bind_main_udp(port: u16) -> io::Result<(UdpSocket, UdpSocket)> {
-    let main_v4 = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
-    let main_v6 = bind_udp_v6(port)?;
-    Ok((main_v4, main_v6))
+/// Bind the main UDP sockets: IPv4 on `0.0.0.0:port` and, when IPv6 is
+/// enabled and the system supports it, an IPv6-only socket on `[::]:port`
+/// sharing the same port.
+///
+/// With port 0, the IPv6 socket is bound first (its own random port); binding
+/// it fails exactly when the system has no IPv6 support, in which case we
+/// bind an IPv4 socket on port 0 directly - no retries needed. When v6 binds
+/// successfully, a v4 socket is paired on v6's port, retrying with a fresh
+/// v6 port on conflict (up to 20 attempts).
+///
+/// A missing second socket (IPv6 unsupported or disabled) is a silent
+/// downgrade to IPv4 only, not an error.
+async fn bind_main_udp(port: u16, enable_ipv6: bool) -> io::Result<(UdpSocket, Option<UdpSocket>)> {
+    if !enable_ipv6 {
+        let main_v4 = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
+        return Ok((main_v4, None));
+    }
+    if port != 0 {
+        let main_v4 = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
+        return bind_v6_same_port(main_v4, port).await;
+    }
+    // Bind an IPv6-only socket on port 0 first. On systems without IPv6 the
+    // bind fails, so this doubles as a capability probe - no retry needed.
+    match bind_udp_v6(0) {
+        Ok(mut main_v6) => {
+            // IPv6 is supported. Pair the v4 socket on the same port; when
+            // the v4 bind conflicts, re-bind v6 for a fresh port and retry,
+            // up to 20 attempts.
+            for _ in 0..20 {
+                let port = main_v6.local_addr()?.port();
+                if let Ok(main_v4) =
+                    UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))).await
+                {
+                    return Ok((main_v4, Some(main_v6)));
+                }
+                main_v6 = bind_udp_v6(0)?;
+            }
+            log::warn!("failed to pair the main v4/v6 UDP ports after 20 attempts, using IPv4 only");
+            let main_v4 = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?;
+            Ok((main_v4, None))
+        }
+        Err(e) => {
+            log::warn!("IPv6 main socket unavailable, using IPv4 only: {e}");
+            let main_v4 = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?;
+            Ok((main_v4, None))
+        }
+    }
+}
+
+/// Bind the IPv6 socket on the v4 socket's port, downgrading to IPv4 only
+/// when the system has no IPv6 support or the port is unavailable.
+async fn bind_v6_same_port(main_v4: UdpSocket, port: u16) -> io::Result<(UdpSocket, Option<UdpSocket>)> {
+    match bind_udp_v6(port) {
+        Ok(main_v6) => Ok((main_v4, Some(main_v6))),
+        Err(e) => {
+            log::warn!("IPv6 main socket unavailable, falling back to IPv4 only: {e}");
+            Ok((main_v4, None))
+        }
+    }
 }
 
 /// Bind an IPv6-only UDP socket on `[::]:port`.

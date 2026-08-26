@@ -32,12 +32,13 @@ impl TcpConnection {
 
 /// A shared pool of sockets. Owns all Arcs.
 ///
-/// The main IPv4 and IPv6 UDP sockets are fixed at construction time and
-/// never change, so they need no lock. Assistant UDP sockets are created and
-/// removed dynamically (e.g. symmetric NAT probing) and live in a locked list.
+/// The main IPv4 UDP socket is fixed at construction time and never changes,
+/// so it needs no lock. A main IPv6 UDP socket is optionally bound when IPv6
+/// is enabled and supported. Assistant UDP sockets are created and removed
+/// dynamically (e.g. symmetric NAT probing) and live in a locked list.
 pub struct SocketPool {
     main_udp_v4: Arc<UdpSocket>,
-    main_udp_v6: Arc<UdpSocket>,
+    main_udp_v6: Option<Arc<UdpSocket>>,
     assistant_udp: RwLock<Vec<UdpEntry>>,
     tcp_conns: RwLock<HashMap<SocketAddr, Arc<TcpConnection>>>,
     data_tx: mpsc::Sender<(super::transport::Transport, Bytes)>,
@@ -48,19 +49,23 @@ pub struct SocketPool {
 }
 
 impl SocketPool {
-    /// Create a pool from main IPv4 and IPv6 UDP sockets.
+    /// Create a pool from the main IPv4 UDP socket and an optional main IPv6
+    /// UDP socket.
     pub fn new(
         main_udp_v4: UdpSocket,
-        main_udp_v6: UdpSocket,
+        main_udp_v6: Option<UdpSocket>,
         init_codec: Box<dyn InitCodec>,
     ) -> (Self, mpsc::Receiver<(super::transport::Transport, Bytes)>) {
         let (data_tx, data_rx) = mpsc::channel(512);
         let (global_shutdown, _) = broadcast::channel(4);
 
         let main_udp_v4 = Arc::new(main_udp_v4);
-        let main_udp_v6 = Arc::new(main_udp_v6);
         Self::spawn_udp_tasks(main_udp_v4.clone(), &data_tx, &global_shutdown);
-        Self::spawn_udp_tasks(main_udp_v6.clone(), &data_tx, &global_shutdown);
+        let main_udp_v6 = main_udp_v6.map(|s| {
+            let s = Arc::new(s);
+            Self::spawn_udp_tasks(s.clone(), &data_tx, &global_shutdown);
+            s
+        });
 
         let pool = Self {
             main_udp_v4,
@@ -256,13 +261,18 @@ impl SocketPool {
 
     /// Send data to an address via the matching family main UDP socket.
     pub async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<()> {
-        let socket = if addr.is_ipv4() {
-            &self.main_udp_v4
-        } else {
-            &self.main_udp_v6
-        };
-        socket
-            .try_send_to(buf, addr)
+        if addr.is_ipv4() {
+            return self
+                .main_udp_v4
+                .try_send_to(buf, addr)
+                .map(|_| ())
+                .map_err(|e| io::Error::other(format!("send failed: {e}")));
+        }
+        let v6 = self
+            .main_udp_v6
+            .as_ref()
+            .ok_or_else(|| io::Error::other("IPv6 main socket not available"))?;
+        v6.try_send_to(buf, addr)
             .map(|_| ())
             .map_err(|e| io::Error::other(format!("send failed: {e}")))
     }
@@ -270,7 +280,9 @@ impl SocketPool {
     /// Send data through ALL UDP sockets (main v4/v6 + assistant) to a specific address.
     pub async fn try_send_via_all(&self, buf: &[u8], addr: SocketAddr) {
         let _ = self.main_udp_v4.try_send_to(buf, addr);
-        let _ = self.main_udp_v6.try_send_to(buf, addr);
+        if let Some(v6) = &self.main_udp_v6 {
+            let _ = v6.try_send_to(buf, addr);
+        }
         let sockets = self.assistant_udp.read().await;
         for entry in sockets.iter() {
             let _ = entry.socket.try_send_to(buf, addr);
@@ -320,23 +332,26 @@ impl SocketPool {
         self.tcp_conns.read().await.values().cloned().collect()
     }
 
-    /// Get a UDP socket by index: 0 = main IPv4, 1 = main IPv6, 2+ = assistants.
+    /// Get a UDP socket by index: 0 = main IPv4, then main IPv6 (if present),
+    /// then assistants.
     pub async fn udp_socket(&self, index: usize) -> Option<Arc<UdpSocket>> {
+        let main_count = 1 + usize::from(self.main_udp_v6.is_some());
         match index {
             0 => Some(self.main_udp_v4.clone()),
-            1 => Some(self.main_udp_v6.clone()),
+            1 if self.main_udp_v6.is_some() => self.main_udp_v6.clone(),
             _ => self
                 .assistant_udp
                 .read()
                 .await
-                .get(index - 2)
+                .get(index - main_count)
                 .map(|e| e.socket.clone()),
         }
     }
 
-    /// Get all UDP sockets: main IPv4, main IPv6, then assistants.
+    /// Get all UDP sockets: main IPv4, main IPv6 (if present), then assistants.
     pub async fn udp_sockets(&self) -> Vec<Arc<UdpSocket>> {
-        let mut sockets = vec![self.main_udp_v4.clone(), self.main_udp_v6.clone()];
+        let mut sockets = vec![self.main_udp_v4.clone()];
+        sockets.extend(self.main_udp_v6.iter().cloned());
         sockets.extend(
             self.assistant_udp
                 .read()

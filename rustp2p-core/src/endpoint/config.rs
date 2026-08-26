@@ -26,6 +26,9 @@ pub struct Config {
     pub(crate) mapping_tcp_addr: Vec<SocketAddr>,
     pub(crate) mapping_udp_addr: Vec<SocketAddr>,
     pub(crate) default_interface: Option<LocalInterface>,
+    /// Whether to also bind a main IPv6 UDP socket. When true but the system
+    /// has no IPv6 support, binding silently falls back to IPv4 only.
+    pub(crate) enable_ipv6: bool,
 }
 
 impl Default for Config {
@@ -41,6 +44,7 @@ impl Default for Config {
             mapping_tcp_addr: vec![],
             mapping_udp_addr: vec![],
             default_interface: None,
+            enable_ipv6: true,
         }
     }
 }
@@ -113,6 +117,12 @@ impl Config {
 
     pub fn default_interface(mut self, interface: LocalInterface) -> Self {
         self.default_interface = Some(interface);
+        self
+    }
+
+    /// Enable or disable binding a main IPv6 UDP socket.
+    pub fn enable_ipv6(mut self, enable: bool) -> Self {
+        self.enable_ipv6 = enable;
         self
     }
 }
