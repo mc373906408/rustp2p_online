@@ -197,7 +197,7 @@ impl SocketPool {
         let local_addr = read_half
             .local_addr()
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
-        let (mut decoder, _encoder) = self.init_codec.codec(peer_addr)?;
+        let (mut decoder, mut encoder) = self.init_codec.codec(peer_addr)?;
         let (write_tx, mut write_rx) = mpsc::channel::<Bytes>(64);
         let data_tx = self.data_tx.clone();
         let mut shutdown_rx = self.global_shutdown.subscribe();
@@ -243,15 +243,13 @@ impl SocketPool {
         // Write loop using Encoder
         let pool_for_write = self.clone();
         let mut shutdown_rx = self.global_shutdown.subscribe();
-        let enc = Arc::new(tokio::sync::Mutex::new(_encoder));
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     data = write_rx.recv() => {
                         match data {
                             Some(data) => {
-                                let mut enc = enc.lock().await;
-                                if let Err(e) = enc.encode(&mut write_half, &data).await {
+                                if let Err(e) = encoder.encode(&mut write_half, &data).await {
                                     log::warn!("TCP encode error: {e}");
                                     break;
                                 }
