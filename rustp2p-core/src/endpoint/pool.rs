@@ -318,8 +318,12 @@ impl SocketPool {
         Ok(weak)
     }
 
-    /// Send data through ALL assistant UDP sockets to a specific address.
+    /// Send data through all assistant UDP sockets (IPv4 only) to a specific
+    /// address. Does nothing for IPv6 targets.
     pub fn try_send_via_assistants(&self, buf: &[u8], addr: SocketAddr) -> io::Result<()> {
+        if addr.is_ipv6() {
+            return Ok(());
+        }
         let sockets = self.assistant_udp.read();
         for entry in sockets.iter() {
             entry
@@ -348,15 +352,19 @@ impl SocketPool {
             .map_err(|e| io::Error::other(format!("send failed: {e}")))
     }
 
-    /// Send data through ALL UDP sockets (main v4/v6 + assistant) to a specific address.
+    /// Send data through the UDP sockets matching the target's address family:
+    /// the matching main socket, plus the (IPv4-only) assistant sockets for
+    /// IPv4 targets. Sockets of the other family are skipped, so no doomed
+    /// syscalls are made.
     pub fn try_send_via_all(&self, buf: &[u8], addr: SocketAddr) {
-        let _ = self.main_udp_v4.try_send_to(buf, addr);
-        if let Some(v6) = &self.main_udp_v6 {
+        if addr.is_ipv4() {
+            let _ = self.main_udp_v4.try_send_to(buf, addr);
+            let sockets = self.assistant_udp.read();
+            for entry in sockets.iter() {
+                let _ = entry.socket.try_send_to(buf, addr);
+            }
+        } else if let Some(v6) = &self.main_udp_v6 {
             let _ = v6.try_send_to(buf, addr);
-        }
-        let sockets = self.assistant_udp.read();
-        for entry in sockets.iter() {
-            let _ = entry.socket.try_send_to(buf, addr);
         }
     }
 
@@ -975,7 +983,8 @@ pub struct Sender(pub(crate) Arc<SocketPool>);
 impl Sender {
     // === Send methods ===
 
-    /// Send data through ALL UDP sockets (main + assistant) to a specific address.
+    /// Send data through all UDP sockets matching the target's address family
+    /// (main + assistant) to a specific address.
     pub fn try_send_via_all(&self, buf: &[u8], addr: SocketAddr) {
         self.0.try_send_via_all(buf, addr);
     }
@@ -985,7 +994,8 @@ impl Sender {
         self.0.send_to(buf, addr)
     }
 
-    /// Send data through ALL assistant UDP sockets to a specific address.
+    /// Send data through all assistant UDP sockets (IPv4 only) to a specific
+    /// address. Does nothing for IPv6 targets.
     pub fn try_send_via_assistants(&self, buf: &[u8], addr: SocketAddr) -> io::Result<()> {
         self.0.try_send_via_assistants(buf, addr)
     }
