@@ -110,6 +110,11 @@ pub fn bind_udp(
     bind_udp_ops(addr, true, default_interface)
 }
 
+/// Upper bound for a single non-blocking TCP connect attempt. Without this,
+/// a peer that silently drops SYNs would leave the connect pending until the
+/// OS-level TCP timeout (minutes), blocking callers for that whole time.
+const TCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub(crate) async fn connect_tcp(
     addr: SocketAddr,
     bind_port: u16,
@@ -117,7 +122,15 @@ pub(crate) async fn connect_tcp(
     ttl: Option<u8>,
 ) -> io::Result<tokio::net::TcpStream> {
     let socket = create_tcp0(addr, bind_port, default_interface, ttl)?;
-    socket.writable().await?;
+    tokio::time::timeout(TCP_CONNECT_TIMEOUT, socket.writable())
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP connect timed out"))??;
+    // A failed non-blocking connect (e.g. ECONNREFUSED) also makes the socket
+    // writable; only SO_ERROR reveals the real outcome. Without this check a
+    // dead connection would be reported as successfully established.
+    if let Some(err) = socket.take_error()? {
+        return Err(err);
+    }
     Ok(socket)
 }
 
