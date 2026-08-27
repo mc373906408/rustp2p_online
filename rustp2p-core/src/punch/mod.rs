@@ -355,7 +355,7 @@ impl Puncher {
                     return index;
                 }
                 let addr = SocketAddr::V4(SocketAddrV4::new(*pub_ip, *port));
-                let _ = self.pool.try_send_via_all(buf, addr);
+                self.pool.try_send_via_all(buf, addr);
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         }

@@ -529,12 +529,11 @@ impl ProtocolLayer {
         self.transport
             .send_raw_to_addr(packet.as_bytes(), addr)
             .await?;
-        self.pending_hello_routes
-            .insert(RouteKey::new(
-                Protocol::UDP,
-                self.transport.raw_local_addr(),
-                addr,
-            ));
+        self.pending_hello_routes.insert(RouteKey::new(
+            Protocol::UDP,
+            self.transport.raw_local_addr(),
+            addr,
+        ));
 
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
@@ -767,7 +766,10 @@ impl ProtocolLayer {
                 } else {
                     self.transport.upsert_peer_info(hello.peer);
                 }
-                let _ = self.hello_tx.send_async((route_key.peer_addr(), peer_id)).await;
+                let _ = self
+                    .hello_tx
+                    .send_async((route_key.peer_addr(), peer_id))
+                    .await;
                 self.ingest_route_entries(hello.peers, route_key).await?;
             }
             ProtocolType::IDRouteQuery => {

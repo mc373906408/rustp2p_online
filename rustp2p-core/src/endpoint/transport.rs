@@ -1,6 +1,6 @@
+use bytes::Bytes;
 use std::io;
 use std::net::SocketAddr;
-use bytes::Bytes;
 use tokio::sync::mpsc;
 
 use crate::route_table::{Protocol, RouteKey};
@@ -75,12 +75,10 @@ impl Transport {
                     .map_err(|_| io::Error::other("UDP socket dropped"))?;
                 Ok(())
             }
-            TransportInner::Tcp(write_tx) => {
-                write_tx
-                    .send(data)
-                    .await
-                    .map_err(|_| io::Error::other("TCP connection closed"))
-            }
+            TransportInner::Tcp(write_tx) => write_tx
+                .send(data)
+                .await
+                .map_err(|_| io::Error::other("TCP connection closed")),
         }
     }
 

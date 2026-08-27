@@ -336,14 +336,14 @@ async fn bind_main_udp(port: u16, enable_ipv6: bool) -> io::Result<(UdpSocket, O
             // up to 20 attempts.
             for _ in 0..20 {
                 let port = main_v6.local_addr()?.port();
-                if let Ok(main_v4) =
-                    UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))).await
-                {
+                if let Ok(main_v4) = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))).await {
                     return Ok((main_v4, Some(main_v6)));
                 }
                 main_v6 = bind_udp_v6(0)?;
             }
-            log::warn!("failed to pair the main v4/v6 UDP ports after 20 attempts, using IPv4 only");
+            log::warn!(
+                "failed to pair the main v4/v6 UDP ports after 20 attempts, using IPv4 only"
+            );
             let main_v4 = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?;
             Ok((main_v4, None))
         }
@@ -357,7 +357,10 @@ async fn bind_main_udp(port: u16, enable_ipv6: bool) -> io::Result<(UdpSocket, O
 
 /// Bind the IPv6 socket on the v4 socket's port, downgrading to IPv4 only
 /// when the system has no IPv6 support or the port is unavailable.
-async fn bind_v6_same_port(main_v4: UdpSocket, port: u16) -> io::Result<(UdpSocket, Option<UdpSocket>)> {
+async fn bind_v6_same_port(
+    main_v4: UdpSocket,
+    port: u16,
+) -> io::Result<(UdpSocket, Option<UdpSocket>)> {
     match bind_udp_v6(port) {
         Ok(main_v6) => Ok((main_v4, Some(main_v6))),
         Err(e) => {
