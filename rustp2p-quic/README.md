@@ -27,7 +27,7 @@ between `A` and `C`. Reliable traffic is still end-to-end QUIC:
 
 Internally this is split into three layers:
 
-- `transport` owns `rustp2p-core::endpoint::EndPoint`, real reachable addresses, multiple routes
+- `transport` owns a `rustp2p-core::endpoint::TunnelIncoming`, real reachable addresses, multiple routes
   per `PeerId`, and raw wire-byte send/receive.
 - `protocol` owns the custom rustp2p packet wire format, control payload encoding, discovery,
   relay forwarding, NAT candidate exchange, and punch decisions.
@@ -239,6 +239,7 @@ For symmetric NAT, enable auxiliary UDP sockets so the puncher can send from mul
 ```rust
 Endpoint::builder()
     .max_assistant_sockets(4)
+    .tunnel_idle_timeout(std::time::Duration::from_secs(60))
     // ...
 ```
 

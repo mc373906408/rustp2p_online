@@ -1,5 +1,4 @@
 use bytes::{Bytes, BytesMut};
-use std::collections::HashMap;
 use std::io::{self, IoSlice};
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
@@ -13,6 +12,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::endpoint::codec::InitCodec;
+use crate::endpoint::tunnel::{Tunnel, UdpDispatcher};
+use crate::route_table::{Protocol, RouteKey};
 
 #[cfg(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android")))]
 const UDP_BATCH_SIZE: usize = 16;
@@ -24,21 +25,6 @@ struct UdpEntry {
     _shutdown: broadcast::Sender<()>,
 }
 
-/// A TCP connection with Encoder for writing.
-pub struct TcpConnection {
-    pub peer_addr: SocketAddr,
-    write_tx: mpsc::Sender<Bytes>,
-}
-
-impl TcpConnection {
-    pub async fn send(&self, data: &[u8]) -> io::Result<()> {
-        self.write_tx
-            .send(Bytes::copy_from_slice(data))
-            .await
-            .map_err(|_| io::Error::other("TCP connection closed"))
-    }
-}
-
 /// A shared pool of sockets. Owns all Arcs.
 ///
 /// The main IPv4 UDP socket is fixed at construction time and never changes,
@@ -48,52 +34,62 @@ impl TcpConnection {
 pub struct SocketPool {
     main_udp_v4: Arc<UdpSocket>,
     main_udp_v6: Option<Arc<UdpSocket>>,
+    /// Serializes whole assistant-socket model transitions. The list's own
+    /// lock only protects individual reads and writes and cannot make a
+    /// count-then-add sequence atomic.
+    assistant_model_lock: parking_lot::Mutex<()>,
     assistant_udp: parking_lot::RwLock<Vec<UdpEntry>>,
-    tcp_conns: parking_lot::RwLock<HashMap<SocketAddr, Arc<TcpConnection>>>,
-    data_tx: mpsc::Sender<(super::transport::Transport, BytesMut)>,
+    accept_tx: mpsc::Sender<Tunnel>,
+    udp_dispatcher: Arc<UdpDispatcher>,
     /// Global shutdown - kills ALL tasks (main + sub)
     global_shutdown: broadcast::Sender<()>,
     init_codec: Box<dyn InitCodec>,
-    connect_lock: tokio::sync::Mutex<()>,
     /// Maximum UDP datagram size; receive buffers are sized by this.
     max_udp_datagram_size: usize,
 }
 
 impl SocketPool {
     /// Create a pool from the main IPv4 UDP socket and an optional main IPv6
-    /// UDP socket. Incoming data is forwarded through `data_tx`, whose
-    /// channel (and thus its capacity) is owned by the caller.
+    /// UDP socket. New five-tuples are forwarded through `accept_tx`.
     pub fn new(
         main_udp_v4: UdpSocket,
         main_udp_v6: Option<UdpSocket>,
-        data_tx: mpsc::Sender<(super::transport::Transport, BytesMut)>,
+        accept_tx: mpsc::Sender<Tunnel>,
         init_codec: Box<dyn InitCodec>,
         max_udp_datagram_size: usize,
     ) -> Self {
         let (global_shutdown, _) = broadcast::channel(4);
+        let udp_dispatcher = UdpDispatcher::new();
 
         let main_udp_v4 = Arc::new(main_udp_v4);
         Self::spawn_udp_tasks(
             main_udp_v4.clone(),
-            &data_tx,
+            &accept_tx,
+            &udp_dispatcher,
             &global_shutdown,
             max_udp_datagram_size,
         );
         let main_udp_v6 = main_udp_v6.map(|s| {
             let s = Arc::new(s);
-            Self::spawn_udp_tasks(s.clone(), &data_tx, &global_shutdown, max_udp_datagram_size);
+            Self::spawn_udp_tasks(
+                s.clone(),
+                &accept_tx,
+                &udp_dispatcher,
+                &global_shutdown,
+                max_udp_datagram_size,
+            );
             s
         });
 
         Self {
             main_udp_v4,
             main_udp_v6,
+            assistant_model_lock: parking_lot::Mutex::new(()),
             assistant_udp: parking_lot::RwLock::new(Vec::new()),
-            tcp_conns: parking_lot::RwLock::new(HashMap::new()),
-            data_tx,
+            accept_tx,
+            udp_dispatcher,
             global_shutdown,
             init_codec,
-            connect_lock: tokio::sync::Mutex::new(()),
             max_udp_datagram_size,
         }
     }
@@ -101,7 +97,8 @@ impl SocketPool {
     /// Spawn the read and write tasks for one UDP socket.
     fn spawn_udp_tasks(
         socket: Arc<UdpSocket>,
-        data_tx: &mpsc::Sender<(super::transport::Transport, BytesMut)>,
+        accept_tx: &mpsc::Sender<Tunnel>,
+        udp_dispatcher: &Arc<UdpDispatcher>,
         global_shutdown: &broadcast::Sender<()>,
         max_udp_datagram_size: usize,
     ) {
@@ -109,13 +106,15 @@ impl SocketPool {
 
         let mut global_shutdown_rx = global_shutdown.subscribe();
         let mut socket_shutdown_rx = global_shutdown.subscribe();
-        let data_tx_clone = data_tx.clone();
+        let accept_tx = accept_tx.clone();
+        let udp_dispatcher = udp_dispatcher.clone();
         let s = socket.clone();
         tokio::spawn(async move {
             Self::run_udp_reader(
                 s,
                 write_tx,
-                data_tx_clone,
+                accept_tx,
+                udp_dispatcher,
                 &mut global_shutdown_rx,
                 &mut socket_shutdown_rx,
                 max_udp_datagram_size,
@@ -146,7 +145,8 @@ impl SocketPool {
         // Per-socket shutdown for this assistant socket
         let (socket_shutdown, mut socket_shutdown_rx) = broadcast::channel(4);
         let (write_tx, write_rx) = mpsc::channel::<(Bytes, SocketAddr)>(64);
-        let data_tx = self.data_tx.clone();
+        let accept_tx = self.accept_tx.clone();
+        let udp_dispatcher = self.udp_dispatcher.clone();
         let mut global_shutdown_rx = self.global_shutdown.subscribe();
         let s = socket.clone();
         let max_udp_datagram_size = self.max_udp_datagram_size;
@@ -155,7 +155,8 @@ impl SocketPool {
             Self::run_udp_reader(
                 s,
                 write_tx,
-                data_tx,
+                accept_tx,
+                udp_dispatcher,
                 &mut global_shutdown_rx,
                 &mut socket_shutdown_rx,
                 max_udp_datagram_size,
@@ -195,53 +196,30 @@ impl SocketPool {
         sockets.clear();
     }
 
-    /// Remove a TCP connection from the pool, but only if the map still
-    /// holds that exact connection instance. A task exiting after its
-    /// connection was replaced by a newer one to the same peer must not
-    /// remove the new entry.
-    pub(crate) fn remove_tcp(&self, addr: SocketAddr, conn: &Weak<TcpConnection>) {
-        let mut conns = self.tcp_conns.write();
-        if let Some(existing) = conns.get(&addr) {
-            let same_instance = conn
-                .upgrade()
-                .is_some_and(|conn| Arc::ptr_eq(existing, &conn));
-            if same_instance {
-                conns.remove(&addr);
-            }
-        }
+    /// Locks a complete assistant-socket model transition across all Puncher
+    /// handles backed by this pool.
+    pub(crate) fn lock_assistant_model(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.assistant_model_lock.lock()
     }
 
-    /// Add a TCP connection with Decoder/Encoder.
-    pub fn add_tcp(
-        self: &Arc<Self>,
+    /// Build one TCP tunnel with independent framing and lifetime.
+    fn tcp_tunnel(
+        &self,
         stream: tokio::net::TcpStream,
         peer_addr: SocketAddr,
-    ) -> io::Result<Weak<TcpConnection>> {
+    ) -> io::Result<Tunnel> {
         let (read_half, mut write_half) = stream.into_split();
         let local_addr = read_half
             .local_addr()
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
         let (mut decoder, encoder) = self.init_codec.codec(peer_addr)?;
         let (write_tx, mut write_rx) = mpsc::channel::<Bytes>(64);
-        let data_tx = self.data_tx.clone();
-        let mut shutdown_rx = self.global_shutdown.subscribe();
-
-        // Create Arc<TcpConnection> first so we can get a real Weak reference
-        let conn = Arc::new(TcpConnection {
-            peer_addr,
-            write_tx,
-        });
-        let conn_write_tx = conn.write_tx.clone();
-        // Insert before spawning the tasks: they only remove this exact
-        // instance (checked by identity in remove_tcp), so a task can never
-        // remove a newer connection that replaced this one, and the entry is
-        // guaranteed to exist before any task may try to remove it.
-        self.tcp_conns.write().insert(peer_addr, conn.clone());
-        let weak = Arc::downgrade(&conn);
+        let (data_tx, data_rx) = mpsc::channel(64);
+        let (read_shutdown, _) = broadcast::channel(1);
+        let mut read_global_shutdown = self.global_shutdown.subscribe();
+        let mut read_tunnel_shutdown = read_shutdown.subscribe();
 
         // Read loop using Decoder
-        let pool_for_read = self.clone();
-        let conn_weak = weak.clone();
         tokio::spawn(async move {
             let mut read = read_half;
             let mut buf = BytesMut::with_capacity(64 * 1024);
@@ -254,11 +232,7 @@ impl SocketPool {
                                 loop {
                                     match decoder.decode(&mut buf) {
                                         Ok(Some(data)) => {
-                                            let route = super::transport::Transport::tcp(conn_write_tx.clone(), local_addr, peer_addr);
-                                            // The receiver is gone (endpoint dropped):
-                                            // stop reading instead of spinning and
-                                            // discarding frames, same as the UDP reader.
-                                            if data_tx.send((route, data)).await.is_err() {
+                                            if data_tx.send(data).await.is_err() {
                                                 break 'read;
                                             }
                                         }
@@ -276,19 +250,20 @@ impl SocketPool {
                             }
                         }
                     }
-                    _ = shutdown_rx.recv() => {
-                        log::debug!("TCP read task shutting down");
+                    _ = read_global_shutdown.recv() => {
+                        log::debug!("TCP read task shutting down (global)");
+                        break;
+                    }
+                    _ = read_tunnel_shutdown.recv() => {
+                        log::debug!("TCP read task shutting down (tunnel)");
                         break;
                     }
                 }
             }
-            pool_for_read.remove_tcp(peer_addr, &conn_weak);
         });
 
         // Write loop using Encoder
-        let pool_for_write = self.clone();
-        let conn_weak = weak.clone();
-        let mut shutdown_rx = self.global_shutdown.subscribe();
+        let mut write_global_shutdown = self.global_shutdown.subscribe();
         tokio::spawn(async move {
             let mut encoder = encoder;
             loop {
@@ -311,16 +286,37 @@ impl SocketPool {
                             None => break,
                         }
                     }
-                    _ = shutdown_rx.recv() => {
-                        log::debug!("TCP write task shutting down");
+                    _ = write_global_shutdown.recv() => {
+                        log::debug!("TCP write task shutting down (global)");
                         break;
                     }
                 }
             }
-            pool_for_write.remove_tcp(peer_addr, &conn_weak);
         });
 
-        Ok(weak)
+        Ok(Tunnel::tcp(
+            write_tx,
+            RouteKey::new(Protocol::TCP, local_addr, peer_addr),
+            data_rx,
+            read_shutdown,
+        ))
+    }
+
+    /// Publish an accepted or punched TCP connection to `TunnelIncoming::next`.
+    pub async fn publish_tcp(
+        &self,
+        stream: tokio::net::TcpStream,
+        peer_addr: SocketAddr,
+        initial_data: Option<Bytes>,
+    ) -> io::Result<()> {
+        let tunnel = self.tcp_tunnel(stream, peer_addr)?;
+        if let Some(data) = initial_data {
+            tunnel.send(data).await?;
+        }
+        self.accept_tx
+            .send(tunnel)
+            .await
+            .map_err(|_| io::Error::other("tunnel incoming source closed"))
     }
 
     /// Send data through all assistant UDP sockets (IPv4 only) to a specific
@@ -377,6 +373,7 @@ impl SocketPool {
 
     /// Shutdown all tasks (program exit).
     pub fn shutdown(&self) {
+        self.udp_dispatcher.clear();
         let _ = self.global_shutdown.send(());
     }
 
@@ -388,34 +385,6 @@ impl SocketPool {
     /// Get local address of the main IPv4 UDP socket.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.main_udp_v4.local_addr()
-    }
-
-    /// Find a TCP connection by peer address.
-    pub fn find_tcp(&self, addr: SocketAddr) -> Option<Arc<TcpConnection>> {
-        self.tcp_conns.read().get(&addr).cloned()
-    }
-
-    /// Get or create a TCP connection to the given address (with concurrency protection).
-    pub async fn connect_tcp_internal(
-        self: &Arc<Self>,
-        addr: SocketAddr,
-    ) -> io::Result<Arc<TcpConnection>> {
-        if let Some(conn) = self.find_tcp(addr) {
-            return Ok(conn);
-        }
-        let _guard = self.connect_lock.lock().await;
-        if let Some(conn) = self.find_tcp(addr) {
-            return Ok(conn);
-        }
-        let stream = crate::socket::connect_tcp(addr, 0, None, None).await?;
-        let weak = self.add_tcp(stream, addr)?;
-        weak.upgrade()
-            .ok_or_else(|| io::Error::other("connection dropped immediately"))
-    }
-
-    /// Get all TCP connections.
-    pub fn tcp_connections(&self) -> Vec<Arc<TcpConnection>> {
-        self.tcp_conns.read().values().cloned().collect()
     }
 
     /// Get all UDP sockets: main IPv4, main IPv6 (if present), then assistants.
@@ -431,25 +400,25 @@ impl SocketPool {
         self.assistant_udp.read().len()
     }
 
-    /// Get the main IPv4 UDP socket.
-    pub fn main_socket(&self) -> Option<Arc<UdpSocket>> {
-        Some(self.main_udp_v4.clone())
-    }
-
     async fn run_udp_reader(
         socket: Arc<UdpSocket>,
         write_tx: mpsc::Sender<(Bytes, SocketAddr)>,
-        data_tx: mpsc::Sender<(super::transport::Transport, BytesMut)>,
+        accept_tx: mpsc::Sender<Tunnel>,
+        udp_dispatcher: Arc<UdpDispatcher>,
         global_shutdown_rx: &mut broadcast::Receiver<()>,
         socket_shutdown_rx: &mut broadcast::Receiver<()>,
         max_udp_datagram_size: usize,
     ) {
+        let local_addr = socket
+            .local_addr()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
         #[cfg(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android")))]
         {
             Self::run_udp_reader_mmsg(
                 socket,
                 write_tx,
-                data_tx,
+                accept_tx,
+                udp_dispatcher.clone(),
                 global_shutdown_rx,
                 socket_shutdown_rx,
                 max_udp_datagram_size,
@@ -461,20 +430,23 @@ impl SocketPool {
             Self::run_udp_reader_single(
                 socket,
                 write_tx,
-                data_tx,
+                accept_tx,
+                udp_dispatcher.clone(),
                 global_shutdown_rx,
                 socket_shutdown_rx,
                 max_udp_datagram_size,
             )
             .await;
         }
+        udp_dispatcher.unregister_local(local_addr);
     }
 
     #[cfg(not(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android"))))]
     async fn run_udp_reader_single(
         socket: Arc<UdpSocket>,
         write_tx: mpsc::Sender<(Bytes, SocketAddr)>,
-        data_tx: mpsc::Sender<(super::transport::Transport, BytesMut)>,
+        accept_tx: mpsc::Sender<Tunnel>,
+        udp_dispatcher: Arc<UdpDispatcher>,
         global_shutdown_rx: &mut broadcast::Receiver<()>,
         socket_shutdown_rx: &mut broadcast::Receiver<()>,
         max_udp_datagram_size: usize,
@@ -489,8 +461,8 @@ impl SocketPool {
                     match result {
                         Ok((len, addr)) => {
                             let data = BytesMut::from(&buf[..len]);
-                            let route = super::transport::Transport::udp(write_tx.clone(), local_addr, addr);
-                            if data_tx.send((route, data)).await.is_err() {
+                            let route_key = RouteKey::new(Protocol::UDP, local_addr, addr);
+                            if !udp_dispatcher.dispatch(&accept_tx, &write_tx, route_key, data) {
                                 return;
                             }
                         }
@@ -520,7 +492,8 @@ impl SocketPool {
     async fn run_udp_reader_mmsg(
         socket: Arc<UdpSocket>,
         write_tx: mpsc::Sender<(Bytes, SocketAddr)>,
-        data_tx: mpsc::Sender<(super::transport::Transport, BytesMut)>,
+        accept_tx: mpsc::Sender<Tunnel>,
+        udp_dispatcher: Arc<UdpDispatcher>,
         global_shutdown_rx: &mut broadcast::Receiver<()>,
         socket_shutdown_rx: &mut broadcast::Receiver<()>,
         max_udp_datagram_size: usize,
@@ -563,12 +536,8 @@ impl SocketPool {
 
             for index in 0..count {
                 let data = BytesMut::from(&buffers[index][..]);
-                let route = super::transport::Transport::udp(
-                    write_tx.clone(),
-                    local_addr,
-                    peer_addrs[index],
-                );
-                if data_tx.send((route, data)).await.is_err() {
+                let route_key = RouteKey::new(Protocol::UDP, local_addr, peer_addrs[index]);
+                if !udp_dispatcher.dispatch(&accept_tx, &write_tx, route_key, data) {
                     return;
                 }
             }
@@ -958,97 +927,6 @@ async fn write_all_vectored(write: &mut OwnedWriteHalf, iov: &mut [IoSlice<'_>])
         }
     }
     Ok(())
-}
-
-/// A lightweight handle for sending data and querying socket state.
-///
-/// `Sender` is cloneable and can be moved into async tasks.
-/// It provides send methods and read-only query methods without
-/// exposing internal socket management (add/remove/clean).
-///
-/// # Examples
-///
-/// ```rust,no_run
-/// use rustp2p_core::endpoint::{EndPoint, Config};
-///
-/// # #[tokio::main]
-/// # async fn main() -> std::io::Result<()> {
-/// let ep = EndPoint::bind(Config::new().udp_port(3000)).await?;
-/// let sender = ep.sender();
-///
-/// // Send to a known address
-/// sender.try_send_via_all(b"hello", "127.0.0.1:4000".parse().unwrap());
-///
-/// // Query local address
-/// println!("Listening on: {:?}", sender.local_addr());
-/// # Ok(())
-/// # }
-/// ```
-#[derive(Clone)]
-pub struct Sender(pub(crate) Arc<SocketPool>);
-
-impl Sender {
-    // === Send methods ===
-
-    /// Send data through all UDP sockets matching the target's address family
-    /// (main + assistant) to a specific address.
-    pub fn try_send_via_all(&self, buf: &[u8], addr: SocketAddr) {
-        self.0.try_send_via_all(buf, addr);
-    }
-
-    /// Send data to an address via the main UDP socket.
-    pub fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<()> {
-        self.0.send_to(buf, addr)
-    }
-
-    /// Send data through all assistant UDP sockets (IPv4 only) to a specific
-    /// address. Does nothing for IPv6 targets.
-    pub fn try_send_via_assistants(&self, buf: &[u8], addr: SocketAddr) -> io::Result<()> {
-        self.0.try_send_via_assistants(buf, addr)
-    }
-
-    // === Read-only query methods ===
-
-    /// Get local address of the main IPv4 UDP socket.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.0.local_addr()
-    }
-
-    /// Get the number of assistant sockets.
-    pub fn assistant_count(&self) -> usize {
-        self.0.assistant_count()
-    }
-
-    /// Get all UDP sockets.
-    pub fn udp_sockets(&self) -> Vec<Arc<UdpSocket>> {
-        self.0.udp_sockets()
-    }
-
-    /// Find a TCP connection by peer address.
-    pub fn find_tcp(&self, addr: SocketAddr) -> Option<Arc<TcpConnection>> {
-        self.0.find_tcp(addr)
-    }
-
-    /// Get all TCP connections.
-    pub fn tcp_connections(&self) -> Vec<Arc<TcpConnection>> {
-        self.0.tcp_connections()
-    }
-
-    // === TCP connection methods ===
-
-    /// Establish a TCP connection to the given address.
-    /// If a connection already exists, returns immediately.
-    pub async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
-        self.0.connect_tcp_internal(addr).await?;
-        Ok(())
-    }
-
-    /// Send data to the given address via TCP.
-    /// Automatically establishes a connection if none exists.
-    pub async fn write_to(&self, data: &[u8], addr: SocketAddr) -> io::Result<()> {
-        let conn = self.0.connect_tcp_internal(addr).await?;
-        conn.send(data).await
-    }
 }
 
 #[cfg(all(

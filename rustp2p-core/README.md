@@ -4,7 +4,7 @@
 [![Docs.rs](https://docs.rs/rustp2p-core/badge.svg)](https://docs.rs/rustp2p-core)
 
 `rustp2p-core` is the low-level transport crate in the `rustp2p` workspace. It
-provides UDP/TCP endpoint primitives, route table utilities, STUN helpers, NAT
+provides UDP/TCP tunnel primitives, route table utilities, STUN helpers, NAT
 information types, and hole-punching primitives.
 
 This crate does not provide the high-level PeerId QUIC overlay. For encrypted
@@ -13,8 +13,9 @@ application datagrams, reliable streams, discovery, and relay forwarding, use
 
 ## Features
 
-- UDP and TCP endpoint with a unified `Transport` send handle.
-- Cloneable `Sender` for sending to raw socket addresses.
+- UDP five-tuple and TCP connection tunnels yielded from one `TunnelIncoming`.
+- `Tunnel::split` for moving the receive and cloneable send halves into separate tasks.
+- Cloneable `Puncher` for raw UDP sends, socket queries, NAT discovery, and punching.
 - TCP framing through configurable codecs.
 - Route table utilities with multiple routes per peer id and load balancing.
 - STUN-based NAT type and port-range detection when explicitly configured.
@@ -31,44 +32,43 @@ explicitly when NAT detection is needed.
 rustp2p-core = "0.1"
 ```
 
-### Echo Endpoint
+### Echo Tunnels
 
 ```rust
 use bytes::Bytes;
-use rustp2p_core::endpoint::{Config, EndPoint};
+use rustp2p_core::endpoint::{Config, TunnelIncoming};
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let mut endpoint = EndPoint::bind(Config::new().udp_port(3000).tcp_port(3000)).await?;
+    let mut incoming = TunnelIncoming::bind(Config::new().udp_port(3000).tcp_port(3000)).await?;
 
-    while let Some(received) = endpoint.recv().await {
-        println!(
-            "from={} protocol={:?} bytes={:?}",
-            received.transport.remote_addr(),
-            received.transport.protocol(),
-            received.data
-        );
-        received.transport.send(Bytes::from_static(b"echo")).await?;
+    while let Some(mut tunnel) = incoming.next().await {
+        tokio::spawn(async move {
+            while let Some(data) = tunnel.recv().await {
+                println!("from={} protocol={:?} bytes={:?}",
+                    tunnel.remote_addr(), tunnel.protocol(), data);
+                tunnel.send(Bytes::from_static(b"echo")).await?;
+            }
+            Ok::<_, std::io::Error>(())
+        });
     }
 
     Ok(())
 }
 ```
 
-### Send Through `Sender`
+### Send Through `Puncher`
 
 ```rust
-use rustp2p_core::endpoint::{Config, EndPoint};
+use rustp2p_core::endpoint::{Config, TunnelIncoming};
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let endpoint = EndPoint::bind(Config::new().udp_port(0)).await?;
-    let sender = endpoint.sender();
+    let incoming = TunnelIncoming::bind(Config::new().udp_port(0)).await?;
+    let puncher = incoming.puncher();
 
-    sender.send_to(b"hello", "127.0.0.1:3000".parse().unwrap()).await?;
-    sender
-        .try_send_via_all(b"probe", "127.0.0.1:3000".parse().unwrap())
-        .await;
+    puncher.send_to(b"hello", "127.0.0.1:3000".parse().unwrap())?;
+    puncher.try_send_via_all(b"probe", "127.0.0.1:3000".parse().unwrap());
 
     Ok(())
 }
@@ -79,11 +79,11 @@ async fn main() -> std::io::Result<()> {
 STUN is explicit:
 
 ```rust
-use rustp2p_core::endpoint::{Config, EndPoint};
+use rustp2p_core::endpoint::{Config, TunnelIncoming};
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let endpoint = EndPoint::bind(
+    let incoming = TunnelIncoming::bind(
         Config::new().stun_servers(vec![
             "stun.miwifi.com:3478".to_string(),
             "stun.chat.bilibili.com:3478".to_string(),
@@ -92,31 +92,33 @@ async fn main() -> std::io::Result<()> {
     )
     .await?;
 
-    let nat_info = endpoint.nat_info().await?;
-    endpoint.apply_nat_model(nat_info.nat_type).await?;
+    let puncher = incoming.puncher();
+    let nat_info = puncher.nat_info().await?;
+    puncher.apply_nat_model(nat_info.nat_type)?;
 
     Ok(())
 }
 ```
 
-`apply_nat_model` only applies an externally detected local `NatType`:
+`Puncher::apply_nat_model` only applies an externally detected local `NatType`:
 
 - `NatType::Symmetric` adds assistant UDP sockets up to
   `Config::max_assistant_sockets`.
 - `NatType::Cone` removes assistant UDP sockets.
 
-`Puncher` is separate. It uses the remote peer's `NatInfo` in `PunchInfo` to
-execute punching and does not decide the local socket model.
+`Puncher` does not infer the local socket model: callers supply the detected
+local `NatType`. It also uses the remote peer's `NatInfo` in `PunchInfo` when
+executing hole punching.
 
 ## Core Types
 
 | Type | Purpose |
 | ---- | ------- |
-| `EndPoint` | Binds UDP/TCP sockets, receives packets, and creates handles. |
-| `Received` | Data plus the source `Transport` returned by `EndPoint::recv`. |
-| `Sender` | Cloneable handle for raw address sends and socket queries. |
-| `Transport` | Send handle tied to a received UDP/TCP route. |
-| `RouteKey` | `(Protocol, SocketAddr)` route identity. |
+| `TunnelIncoming` | Binds UDP/TCP sockets and yields logical tunnels through `next`. |
+| `Tunnel` | Single-owner receive stream and send handle for one UDP five-tuple or TCP connection. |
+| `TunnelReadHalf` / `TunnelWriteHalf` | Independently owned halves returned by `Tunnel::split`. |
+| `Puncher` | Cloneable handle for UDP sends, socket queries, NAT discovery, and punching. |
+| `RouteKey` | `(Protocol, local SocketAddr, peer SocketAddr)` route identity. |
 | `RouteTable<T>` | Multi-route table keyed by caller-defined peer id type. |
 | `NatInfo` / `NatType` | NAT shape, local/public addresses, and port metadata. |
 | `Puncher` / `PunchInfo` | Low-level NAT punching primitive. |

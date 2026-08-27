@@ -1,16 +1,17 @@
 use crate::{Config, PeerId};
 use bytes::Bytes;
 use dashmap::DashMap;
-use rustp2p_core::endpoint::{EndPoint, Sender as CoreSender, Transport};
+use rustp2p_core::endpoint::{Tunnel, TunnelIncoming};
 use rustp2p_core::nat::NatInfo;
 use rustp2p_core::punch::PunchInfo;
 use rustp2p_core::route_table::{Route, RouteKey, RouteTable};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+use std::time::Duration;
+use tokio::sync::mpsc;
 
 /// Read-only peer information discovered by the protocol layer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -109,15 +110,7 @@ enum CoreOutboundPacket {
     RoutePacket { route_key: RouteKey, data: Bytes },
 }
 
-enum CoreControl {
-    ApplyNatModel {
-        nat_type: rustp2p_core::nat::NatType,
-        reply: oneshot::Sender<io::Result<()>>,
-    },
-}
-
 struct CoreTransportLayer {
-    sender: CoreSender,
     puncher: rustp2p_core::punch::Puncher,
     local_addr: SocketAddr,
     // Raw socket local address (may be 0.0.0.0/:: when bound to INADDR_ANY),
@@ -127,14 +120,20 @@ struct CoreTransportLayer {
     local_tcp_port: u16,
     raw_tx: flume::Sender<RawTransportPacket>,
     routes: parking_lot::RwLock<Option<RouteTable<PeerId>>>,
-    // Cache of live core transport handles keyed by RouteKey.
+    // Cache of live per-tunnel actor senders keyed by RouteKey.
     //
     // This is deliberately not the route table. A packet received from an
     // address proves only that the remote side reached us once; protocol
     // control messages decide whether the route is bidirectional and confirmed.
-    transports: DashMap<RouteKey, Transport>,
+    tunnels: DashMap<RouteKey, TunnelActor>,
+    next_tunnel_id: AtomicU64,
+    tunnel_idle_timeout: Duration,
     outbound_tx: mpsc::UnboundedSender<CoreOutboundPacket>,
-    control_tx: mpsc::UnboundedSender<CoreControl>,
+}
+
+struct TunnelActor {
+    id: u64,
+    outbound_tx: mpsc::Sender<Bytes>,
 }
 
 impl CoreTransportLayer {
@@ -157,37 +156,34 @@ impl CoreTransportLayer {
             .load_balance(config.load_balance)
             .max_assistant_sockets(config.max_assistant_sockets);
 
-        let endpoint = EndPoint::bind(core_config).await?;
-        let sender = endpoint.sender();
-        let puncher = endpoint.puncher();
-        let local_tcp_port = endpoint.local_tcp_port();
-        let raw_local_addr = endpoint.local_addr()?;
+        let incoming = TunnelIncoming::bind(core_config).await?;
+        let puncher = incoming.puncher();
+        let local_tcp_port = incoming.local_tcp_port();
+        let raw_local_addr = incoming.local_addr()?;
         let local_addr = normalize_local_addr(raw_local_addr, config.bind_addr);
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
-        let (control_tx, control_rx) = mpsc::unbounded_channel();
         let layer = Arc::new(Self {
-            sender,
             puncher,
             local_addr,
             raw_local_addr,
             local_tcp_port,
             raw_tx,
             routes: parking_lot::RwLock::new(None),
-            transports: DashMap::new(),
+            tunnels: DashMap::new(),
+            next_tunnel_id: AtomicU64::new(1),
+            tunnel_idle_timeout: config.tunnel_idle_timeout,
             outbound_tx,
-            control_tx,
         });
-        layer.start(endpoint, outbound_rx, control_rx);
+        layer.start(incoming, outbound_rx);
         Ok(layer)
     }
 
     fn start(
         self: &Arc<Self>,
-        endpoint: EndPoint,
+        incoming: TunnelIncoming,
         outbound_rx: mpsc::UnboundedReceiver<CoreOutboundPacket>,
-        control_rx: mpsc::UnboundedReceiver<CoreControl>,
     ) {
-        self.start_core_receiver(endpoint, control_rx);
+        self.start_core_receiver(incoming);
         self.start_core_sender(outbound_rx);
     }
 
@@ -209,7 +205,7 @@ impl CoreTransportLayer {
     }
 
     async fn send_raw_to_addr(&self, buf: &[u8], addr: SocketAddr) -> io::Result<()> {
-        self.sender.send_to(buf, addr)
+        self.puncher.send_to(buf, addr)
     }
 
     fn try_send_packet(&self, dest: PeerId, data: Bytes) -> io::Result<()> {
@@ -234,62 +230,83 @@ impl CoreTransportLayer {
     }
 
     async fn apply_nat_model(&self, nat_type: rustp2p_core::nat::NatType) -> io::Result<()> {
-        let (reply, result) = oneshot::channel();
-        self.control_tx
-            .send(CoreControl::ApplyNatModel { nat_type, reply })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "core control task closed"))?;
-        result
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "core control reply closed"))?
+        self.puncher.apply_nat_model(nat_type)
     }
 
-    fn start_core_receiver(
-        self: &Arc<Self>,
-        mut endpoint: EndPoint,
-        mut control_rx: mpsc::UnboundedReceiver<CoreControl>,
-    ) {
+    fn start_core_receiver(self: &Arc<Self>, mut incoming: TunnelIncoming) {
         let this = self.clone();
         tokio::spawn(async move {
-            loop {
+            while let Some(tunnel) = incoming.next().await {
+                this.start_tunnel_actor(tunnel);
+            }
+        });
+    }
+
+    fn start_tunnel_actor(self: &Arc<Self>, tunnel: Tunnel) {
+        let route_key = tunnel.route_key();
+        let (mut reader, writer) = tunnel.split();
+        let id = self.next_tunnel_id.fetch_add(1, Ordering::Relaxed);
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(64);
+        let idle_timeout = self.tunnel_idle_timeout;
+        self.tunnels
+            .insert(route_key, TunnelActor { id, outbound_tx });
+
+        let this = self.clone();
+        tokio::spawn(async move {
+            let idle = tokio::time::sleep(idle_timeout);
+            tokio::pin!(idle);
+            'actor: loop {
                 tokio::select! {
-                    received = endpoint.recv() => {
-                        let Some(received) = received else {
+                    data = reader.recv() => {
+                        let Some(data) = data else {
                             break;
                         };
-                        let route_key = received.transport.route_key();
-                        // Store the send handle for this core transport, but do not add
-                        // a PeerId route here. Only the protocol layer can confirm that
-                        // a route is usable for outbound peer traffic.
-                        this.transports
-                            .insert(route_key, received.transport.clone());
-                        if received.data.is_empty() {
+                        idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+                        if data.is_empty() {
                             continue;
                         }
-                        if this
-                            .raw_tx
-                            .send_async(RawTransportPacket {
-                                data: received.data.freeze(),
-                                route_key,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            log::debug!("raw transport receiver closed");
-                            break;
-                        }
-                    }
-                    Some(command) = control_rx.recv() => {
-                        match command {
-                            CoreControl::ApplyNatModel { nat_type, reply } => {
-                                // The core EndPoint owns the socket pool. Apply the local
-                                // NAT model here instead of routing it through Puncher, whose
-                                // job is remote-peer punching strategy.
-                                let _ = reply.send(endpoint.apply_nat_model(nat_type));
+                        let packet = RawTransportPacket {
+                            data: data.freeze(),
+                            route_key,
+                        };
+                        tokio::select! {
+                            result = this.raw_tx.send_async(packet) => {
+                                if result.is_err() {
+                                    log::debug!("raw transport receiver closed");
+                                    break 'actor;
+                                }
+                            }
+                            _ = &mut idle => {
+                                log::debug!("core tunnel idle timeout: {route_key}");
+                                break 'actor;
                             }
                         }
                     }
+                    data = outbound_rx.recv() => {
+                        let Some(data) = data else {
+                            break;
+                        };
+                        tokio::select! {
+                            result = writer.send(data) => {
+                                if let Err(e) = result {
+                                    log::debug!("core tunnel send failed: {e}");
+                                    break 'actor;
+                                }
+                            }
+                            _ = &mut idle => {
+                                log::debug!("core tunnel idle timeout: {route_key}");
+                                break 'actor;
+                            }
+                        }
+                    }
+                    _ = &mut idle => {
+                        log::debug!("core tunnel idle timeout: {route_key}");
+                        break;
+                    }
                 }
             }
+            this.tunnels
+                .remove_if(&route_key, |_, actor| actor.id == id);
         });
     }
 
@@ -326,13 +343,23 @@ impl CoreTransportLayer {
     }
 
     async fn send_to_route(&self, route_key: RouteKey, data: &[u8]) -> io::Result<()> {
-        if let Some(transport) = self.transports.get(&route_key) {
-            return transport.send(Bytes::copy_from_slice(data)).await;
+        if let Some(actor) = self.tunnels.get(&route_key) {
+            let id = actor.id;
+            let outbound_tx = actor.outbound_tx.clone();
+            drop(actor);
+            if outbound_tx.send(Bytes::copy_from_slice(data)).await.is_ok() {
+                return Ok(());
+            }
+            self.tunnels
+                .remove_if(&route_key, |_, actor| actor.id == id);
         }
         if route_key.protocol().is_tcp() {
-            self.sender.write_to(data, route_key.peer_addr()).await
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "TCP tunnel is no longer active",
+            ))
         } else {
-            self.sender.send_to(data, route_key.peer_addr())
+            self.puncher.send_to(data, route_key.peer_addr())
         }
     }
 }
@@ -610,6 +637,9 @@ mod tests {
     use super::{LinkMode, TransportLayer};
     use crate::{Config, Identity, PeerId};
     use std::io;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpStream, UdpSocket};
 
     #[tokio::test]
     async fn unknown_route_returns_not_found() {
@@ -676,6 +706,85 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         assert!(transport.link_mode(peer).is_none());
         transport.close();
+    }
+
+    #[tokio::test]
+    async fn udp_tunnel_actor_expires_and_can_be_recreated_after_read_idle() {
+        let config = Config {
+            identity: Some(Identity::new("idle-udp", "idle-udp-seed").unwrap()),
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            stun_servers: Vec::new(),
+            enable_tcp: false,
+            tunnel_idle_timeout: Duration::from_millis(150),
+            ..Default::default()
+        };
+        let transport = TransportLayer::bind(PeerId::from("idle-udp"), &config)
+            .await
+            .unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        sender
+            .send_to(b"first", transport.local_addr())
+            .await
+            .unwrap();
+        wait_for_tunnel_count(&transport, 1).await;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        sender
+            .send_to(b"refresh", transport.local_addr())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(transport.core.tunnels.len(), 1);
+
+        wait_for_tunnel_count(&transport, 0).await;
+        sender
+            .send_to(b"recreate", transport.local_addr())
+            .await
+            .unwrap();
+        wait_for_tunnel_count(&transport, 1).await;
+        transport.close();
+    }
+
+    #[tokio::test]
+    async fn tcp_tunnel_actor_closes_connection_after_read_idle() {
+        let config = Config {
+            identity: Some(Identity::new("idle-tcp", "idle-tcp-seed").unwrap()),
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            stun_servers: Vec::new(),
+            tunnel_idle_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let transport = TransportLayer::bind(PeerId::from("idle-tcp"), &config)
+            .await
+            .unwrap();
+        let mut client = TcpStream::connect(transport.local_tcp_addr().unwrap())
+            .await
+            .unwrap();
+
+        wait_for_tunnel_count(&transport, 1).await;
+        wait_for_tunnel_count(&transport, 0).await;
+
+        let mut byte = [0_u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read, 0);
+        transport.close();
+    }
+
+    async fn wait_for_tunnel_count(transport: &TransportLayer, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if transport.core.tunnels.len() == expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     async fn test_transport(id: &str) -> std::sync::Arc<TransportLayer> {

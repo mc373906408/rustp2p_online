@@ -49,6 +49,9 @@ pub struct Config {
     pub nat_observers: Vec<PeerId>,
     /// Maximum assistant UDP sockets enabled when the detected local NAT is symmetric.
     pub max_assistant_sockets: usize,
+    /// Maximum period without inbound data before a core UDP or TCP tunnel
+    /// actor is closed.
+    pub tunnel_idle_timeout: Duration,
     /// QUIC certificate verifier used for both server and client certificates.
     pub certificate_verifier: Arc<dyn CertificateVerifier>,
     /// Maximum forwarding TTL for high-level packets.
@@ -78,6 +81,7 @@ impl Default for Config {
             punch_whitelist: None,
             nat_observers: Vec::new(),
             max_assistant_sockets: 4,
+            tunnel_idle_timeout: Duration::from_secs(60),
             certificate_verifier: Arc::new(SkipCertificateVerification),
             max_ttl: 8,
             high_level: false,
@@ -91,6 +95,11 @@ mod tests {
 
     #[test]
     fn default_config_has_no_stun_servers() {
-        assert!(Config::default().stun_servers.is_empty());
+        let config = Config::default();
+        assert!(config.stun_servers.is_empty());
+        assert_eq!(
+            config.tunnel_idle_timeout,
+            std::time::Duration::from_secs(60)
+        );
     }
 }

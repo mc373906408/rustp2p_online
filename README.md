@@ -6,7 +6,7 @@
 `rustp2p` is a Rust workspace for peer-to-peer networking. It currently contains
 two crates:
 
-- `rustp2p-core`: low-level UDP/TCP endpoint primitives, route tables,
+- `rustp2p-core`: low-level UDP/TCP tunnel primitives, route tables,
   NAT/STUN helpers, and hole-punching primitives.
 - `rustp2p-quic`: a PeerId-based QUIC overlay with high-level peer discovery,
   relay forwarding, encrypted QUIC DATAGRAM messages, and reliable QUIC streams.
@@ -23,7 +23,7 @@ Application
   -> quic      (quinn, TLS, stream/datagram, synthetic PeerId addresses)
   -> protocol  (packet format, discovery, relay, NAT observe, punch control)
   -> transport (PeerId routes over rustp2p-core)
-  -> rustp2p-core endpoint
+  -> rustp2p-core TunnelIncoming/Tunnel
   -> UDP/TCP network
 ```
 
@@ -108,9 +108,9 @@ exit
 
 ## Crate Documentation
 
-- `rustp2p-core/README.md` covers the low-level endpoint, route table, STUN,
+- `rustp2p-core/README.md` covers the low-level tunnel API, route table, STUN,
   and punch primitives.
-- `rustp2p-core/DESIGN.md` describes the core endpoint, socket pool, route
+- `rustp2p-core/DESIGN.md` describes the core tunnel incoming source, socket pool, route
   table, NAT, and punch architecture.
 - `rustp2p-quic/README.md` covers the PeerId QUIC API, discovery, relay,
   NAT observation, punching, and the interactive node example.

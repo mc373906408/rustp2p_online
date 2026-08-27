@@ -4,7 +4,7 @@ version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 readme = "README.md"
-description = "Low-level UDP/TCP transport, route table, STUN, and NAT punching primitives for rustp2p"
+description = "Low-level UDP/TCP tunnels, route table, STUN, and NAT punching primitives for rustp2p"
 repository = "https://github.com/rustp2p/rustp2p"
 
 [dependencies]
@@ -43,7 +43,7 @@ log = "0.4.22"
 env_logger = "0.11.5"
 
 [features]
-# Use recvmmsg(2)/sendmmsg(2) for endpoint UDP tasks on Linux/Android.
+# Use recvmmsg(2)/sendmmsg(2) for incoming UDP tasks on Linux/Android.
 sendmmsg = []
 
 [[example]]

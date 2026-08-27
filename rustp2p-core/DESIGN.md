@@ -13,9 +13,8 @@ their own application protocol on top of raw bytes.
 ```mermaid
 flowchart TD
     app["Application or higher-level crate"]
-    endpoint["EndPoint"]
-    sender["Sender"]
-    transport["Transport"]
+    endpoint["TunnelIncoming"]
+    transport["Tunnel"]
     puncher["Puncher"]
     pool["SocketPool"]
     udp["UDP sockets<br/>main + assistant"]
@@ -24,7 +23,6 @@ flowchart TD
     nat["NAT/STUN helpers"]
 
     app --> endpoint
-    endpoint --> sender
     endpoint --> puncher
     endpoint --> pool
     pool --> udp
@@ -35,55 +33,63 @@ flowchart TD
     puncher --> pool
 ```
 
-The public entry point is `EndPoint`. Internally it owns a `SocketPool`, starts
-UDP/TCP reader tasks, and receives bytes through one channel. `Sender` is a
-cloneable handle for outbound operations. `Transport` is a send handle attached
-to a received packet's source route.
+The public entry point is `TunnelIncoming`. Internally it owns a `SocketPool`,
+starts UDP/TCP reader tasks, and yields logical tunnels. `Puncher` is the
+cloneable operational handle for raw UDP sends, socket queries, NAT discovery,
+and punching. A `Tunnel` owns the receive side and send handle for one UDP
+five-tuple or one TCP connection.
 
-## Endpoint And Socket Pool
+## Tunnel Incoming And Socket Pool
 
-`EndPoint::bind(Config)` creates:
+`TunnelIncoming::bind(Config)` creates:
 
 - one main UDP socket when UDP is enabled;
 - a TCP listener when TCP is enabled;
-- reader tasks that forward incoming data as `(Transport, BytesMut)`;
-- a `Sender` and `Puncher` backed by the same socket pool.
+- UDP reader tasks that dispatch packets by `RouteKey`;
+- TCP reader/writer tasks for each accepted connection;
+- a `Puncher` backed by the same socket pool.
 
 TCP uses an `InitCodec` to frame bytes. The default codec is length-prefixed.
 UDP packets are delivered as received.
 
-`EndPoint::recv()` returns:
+`TunnelIncoming::next()` returns a `Tunnel`. Applications read data with:
 
 ```rust
-Received {
-    data: BytesMut,
-    transport: Transport,
+while let Some(data) = tunnel.recv().await {
+    tunnel.send(data.freeze()).await?;
 }
 ```
 
-The data is delivered mutable so the downstream can modify it in place; call
-`BytesMut::freeze()` if an immutable `Bytes` is preferred.
+UDP uses `Protocol + socket.local_addr() + peer_addr` as its five-tuple key.
+The first packet creates a tunnel and is queued before the tunnel is yielded.
+Later packets for that key go to its bounded receive queue. A full queue drops
+only that tunnel's datagram, so a slow consumer cannot block the shared socket.
 
-The returned `Transport` can reply to the same remote address and exposes its
-`Protocol` and `SocketAddr`.
+Dropping a UDP tunnel unregisters exactly that tunnel instance; the next packet
+for the same key creates a new tunnel. Dropping a TCP tunnel stops both I/O
+tasks and closes the connection. TCP tunnels enter through TCP listener accepts or
+the punching subsystem; `TunnelIncoming` does not expose an outbound connect API.
 
-## Sender
+`Tunnel::split` consumes a tunnel and returns a single-owner `TunnelReadHalf`
+plus a cloneable `TunnelWriteHalf`. Dropping the UDP read half unregisters its
+five-tuple while existing write halves may continue sending. For TCP, dropping
+each half independently stops its corresponding I/O direction.
 
-`Sender` is intentionally narrower than `SocketPool`. It allows callers to send
-and inspect socket state without exposing internal socket management.
+## Puncher Socket Operations
+
+`Puncher` allows callers to send raw UDP data and inspect socket state without
+exposing internal socket management. It also owns NAT discovery and punching.
 
 Important operations:
 
 - `send_to(buf, addr)`: send through the main UDP socket.
 - `try_send_via_all(buf, addr)`: send through all UDP sockets.
-- `send_via_assistants(buf, addr)`: send through assistant UDP sockets.
-- `connect(addr)`: establish or reuse a TCP connection.
-- `write_to(data, addr)`: write to a TCP connection.
-- `local_addr()`, `assistant_count()`, `udp_sockets()`, `tcp_connections()`:
-  read-only socket state queries.
+- `try_send_via_assistants(buf, addr)`: send through assistant UDP sockets.
+- `local_addr()`, `assistant_count()`, and `udp_sockets()`: read-only socket
+  state queries.
 
 Assistant sockets are implementation detail for symmetric NAT probing. They are
-managed through `EndPoint::apply_nat_model`, not directly through `Sender`.
+managed through `Puncher::apply_nat_model`.
 
 ## Route Table
 
@@ -91,7 +97,7 @@ managed through `EndPoint::apply_nat_model`, not directly through `Sender`.
 identified by:
 
 ```text
-RouteKey = Protocol + SocketAddr
+RouteKey = Protocol + local SocketAddr + peer SocketAddr
 ```
 
 Route metrics:
@@ -115,10 +121,10 @@ insert or remove it.
 - configured mapping addresses;
 - symmetric NAT public port range hints.
 
-`EndPoint::nat_info()` runs STUN against explicitly configured servers. Default
+`Puncher::nat_info()` runs STUN against explicitly configured servers. Default
 configuration contains no STUN servers.
 
-`EndPoint::apply_nat_model(nat_type)` does not run detection. It consumes the
+`Puncher::apply_nat_model(nat_type)` does not run detection. It consumes the
 local NAT type supplied by the caller:
 
 - `Symmetric`: add assistant UDP sockets up to `max_assistant_sockets`;
@@ -131,10 +137,10 @@ This keeps NAT detection policy outside the socket model mutation API.
 `Puncher` performs low-level UDP/TCP hole-punching attempts using remote
 `NatInfo` supplied through `PunchInfo`.
 
-The local NAT model is not selected by `Puncher`. Higher layers should:
+The local NAT model is supplied explicitly by higher layers. They should:
 
 1. detect or learn the local `NatType`;
-2. call `EndPoint::apply_nat_model(local_nat_type)`;
+2. call `Puncher::apply_nat_model(local_nat_type)`;
 3. exchange `NatInfo` with the remote peer using their own protocol;
 4. call `Puncher::punch` or `Puncher::punch_now` with remote `NatInfo`.
 
@@ -148,15 +154,15 @@ remote NAT address.
 ```text
 UDP/TCP socket
   -> SocketPool reader task
-  -> EndPoint internal channel
-  -> EndPoint::recv()
-  -> Received { data, transport }
+  -> UDP five-tuple dispatcher or TCP connection queue
+  -> TunnelIncoming::next()
+  -> Tunnel::recv()
 ```
 
 ### Send
 
 ```text
-Sender::send_to / Transport::send / Sender::write_to
+Puncher::send_to / Tunnel::send
   -> SocketPool
   -> UDP socket or TCP connection
   -> network
@@ -165,8 +171,8 @@ Sender::send_to / Transport::send / Sender::write_to
 ### Route Use
 
 ```text
-Received.transport
-  -> RouteKey::from_transport()
+Tunnel
+  -> RouteKey::from_tunnel()
   -> caller protocol confirms route
   -> RouteTable<T>::add_route(...)
   -> later send by selected RouteKey

@@ -125,6 +125,13 @@ impl Builder {
         self
     }
 
+    /// Sets the maximum period without inbound data before an underlying UDP
+    /// or TCP tunnel is closed. Outbound-only traffic does not refresh it.
+    pub fn tunnel_idle_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.config.tunnel_idle_timeout = timeout;
+        self
+    }
+
     /// Builds and starts the endpoint.
     ///
     /// Bootstrap addresses are contacted before this method returns.

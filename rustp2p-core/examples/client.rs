@@ -7,7 +7,7 @@ use bytes::{BufMut, BytesMut};
 use clap::Parser;
 use env_logger::Env;
 use parking_lot::Mutex;
-use rustp2p_core::endpoint::{Config, EndPoint, Sender};
+use rustp2p_core::endpoint::{Config, Tunnel, TunnelIncoming};
 use rustp2p_core::idle::IdleRouteManager;
 use rustp2p_core::nat::NatInfo;
 use rustp2p_core::punch::{PunchInfo, PunchModel, Puncher};
@@ -61,7 +61,7 @@ async fn main() {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
     log::info!("my_id:{my_id},server:{server},port:{port}");
 
-    let mut ep = EndPoint::bind(
+    let mut incoming = TunnelIncoming::bind(
         Config::new()
             .udp_port(port)
             .tcp_port(port)
@@ -73,13 +73,12 @@ async fn main() {
     )
     .await
     .unwrap();
-    let sender = ep.sender();
-    let puncher = ep.puncher();
+    let puncher = incoming.puncher();
     let route_table: RouteTable<u32> = RouteTable::default();
     let idle_route_manager = IdleRouteManager::new(Duration::from_secs(12), route_table.clone());
 
     // Get NAT info
-    let nat_info = Arc::new(Mutex::new(ep.nat_info().await.unwrap()));
+    let nat_info = Arc::new(Mutex::new(puncher.nat_info().await.unwrap()));
     log::info!("NAT info: {:?}", nat_info.lock());
 
     // Register with server (use main socket only)
@@ -88,12 +87,12 @@ async fn main() {
         request.put_u32(UP);
         request.put_u32(my_id);
         request.put_u32(MY_SERVER_ID);
-        sender.send_to(request.freeze().as_ref(), server).ok();
+        puncher.send_to(request.freeze().as_ref(), server).ok();
     }
 
     let peer_list = Arc::new(Mutex::new(Vec::<u32>::new()));
     let peer_list1 = peer_list.clone();
-    let sender1 = sender.clone();
+    let puncher1 = puncher.clone();
     let nat_info1 = nat_info.clone();
 
     // Idle route cleanup
@@ -129,14 +128,14 @@ async fn main() {
                     let nat_info = nat_info1.lock().clone();
                     let data = serde_json::to_string(&nat_info).unwrap();
                     request.extend_from_slice(data.as_bytes());
-                    sender1.send_to(request.freeze().as_ref(), server).ok();
+                    puncher1.send_to(request.freeze().as_ref(), server).ok();
                 }
             }
         }
     });
 
     // Periodic public address request (use main socket only)
-    let sender2 = sender.clone();
+    let puncher2 = puncher.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
@@ -144,7 +143,7 @@ async fn main() {
             request.put_u32(PUBLIC_ADDR_REQ);
             request.put_u32(my_id);
             request.put_u32(MY_SERVER_ID);
-            sender2.send_to(request.freeze().as_ref(), server).ok();
+            puncher2.send_to(request.freeze().as_ref(), server).ok();
         }
     });
 
@@ -155,18 +154,15 @@ async fn main() {
         nat_info,
         route_table: route_table.clone(),
         server,
-        sender,
     };
 
     // Handle incoming messages
-    loop {
-        let received = match ep.recv().await {
-            Some(r) => r,
-            None => break,
-        };
+    while let Some(mut tunnel) = incoming.next().await {
         let context_handler = context_handler.clone();
         tokio::spawn(async move {
-            let _ = context_handler.handle(received).await;
+            while let Some(data) = tunnel.recv().await {
+                let _ = context_handler.handle(&tunnel, data).await;
+            }
         });
     }
 }
@@ -180,14 +176,11 @@ struct ContextHandler {
     route_table: RouteTable<u32>,
     #[allow(dead_code)]
     server: SocketAddr,
-    #[allow(dead_code)]
-    sender: Sender,
 }
 
 impl ContextHandler {
-    async fn handle(&self, received: rustp2p_core::endpoint::Received) -> std::io::Result<()> {
-        let data = &received.data;
-        let addr = received.transport.remote_addr();
+    async fn handle(&self, tunnel: &Tunnel, data: BytesMut) -> std::io::Result<()> {
+        let addr = tunnel.remote_addr();
 
         if data.len() < HEAD_LEN {
             log::warn!("invalid protocol {:?},addr={addr:?}", &data[..]);
@@ -221,7 +214,7 @@ impl ContextHandler {
                 let nat_info = self.nat_info.lock().clone();
                 let nat_data = serde_json::to_string(&nat_info).unwrap();
                 request.extend_from_slice(nat_data.as_bytes());
-                received.transport.send(request.freeze()).await.ok();
+                tunnel.send(request.freeze()).await.ok();
 
                 // Start punching to the peer
                 {
@@ -261,13 +254,12 @@ impl ContextHandler {
                 request.put_u32(PUNCH_RES);
                 request.put_u32(self.my_id);
                 request.put_u32(src_id);
-                received.transport.send(request.freeze()).await.ok();
+                tunnel.send(request.freeze()).await.ok();
             }
             PUNCH_RES => {
                 log::info!("======================== PUNCH_RES ========================");
                 // Punch succeeded (bidirectional), add direct route (metric=0)
-                self.route_table
-                    .add_route(src_id, (received.transport.route_key(), 0));
+                self.route_table.add_route(src_id, (tunnel.route_key(), 0));
             }
             PUBLIC_ADDR_RES => {
                 let public_addr =

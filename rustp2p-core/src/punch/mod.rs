@@ -4,6 +4,7 @@ use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use parking_lot::Mutex;
 use rand::seq::SliceRandom;
 use rand::RngExt;
@@ -51,12 +52,27 @@ fn should_punch(stats: &PunchStats, current_time: u64) -> bool {
     current_time.saturating_sub(stats.last_time) >= min_interval
 }
 
+/// A cloneable handle for UDP socket access, NAT discovery, and hole punching.
+///
+/// `Puncher` owns the operations that do not belong to an accepted
+/// [`Tunnel`](crate::endpoint::Tunnel): connectionless UDP sends, socket
+/// inspection, NAT discovery, and punch scheduling.
 #[derive(Clone)]
 pub struct Puncher {
     shuffled_ports: Arc<Vec<u16>>,
     port_cursor: Arc<Mutex<HashMap<SocketAddr, usize>>>,
     punch_stats: Arc<Mutex<HashMap<SocketAddr, PunchStats>>>,
     pool: Arc<SocketPool>,
+    nat_config: Arc<NatQueryConfig>,
+}
+
+struct NatQueryConfig {
+    stun_servers: Vec<String>,
+    mapping_tcp_addr: Vec<SocketAddr>,
+    mapping_udp_addr: Vec<SocketAddr>,
+    default_interface: Option<crate::socket::LocalInterface>,
+    local_tcp_port: u16,
+    max_assistant_sockets: usize,
 }
 
 /// Upper bound for the per-peer punch bookkeeping maps (`punch_stats` and
@@ -66,7 +82,11 @@ pub struct Puncher {
 const MAX_PUNCH_ENTRIES: usize = 4096;
 
 impl Puncher {
-    pub fn new(pool: Arc<SocketPool>) -> Puncher {
+    pub(crate) fn new(
+        pool: Arc<SocketPool>,
+        config: &crate::endpoint::Config,
+        local_tcp_port: u16,
+    ) -> Puncher {
         let mut shuffled_ports: Vec<u16> = (1..=65535).collect();
         shuffled_ports.shuffle(&mut rand::rng());
         Self {
@@ -74,7 +94,132 @@ impl Puncher {
             port_cursor: Arc::new(Mutex::new(HashMap::new())),
             punch_stats: Arc::new(Mutex::new(HashMap::new())),
             pool,
+            nat_config: Arc::new(NatQueryConfig {
+                stun_servers: config.stun_servers.clone(),
+                mapping_tcp_addr: config.mapping_tcp_addr.clone(),
+                mapping_udp_addr: config.mapping_udp_addr.clone(),
+                default_interface: config.default_interface.clone(),
+                local_tcp_port,
+                max_assistant_sockets: config.max_assistant_sockets,
+            }),
         }
+    }
+
+    /// Sends through all UDP sockets matching the target's address family.
+    pub fn try_send_via_all(&self, buf: &[u8], addr: SocketAddr) {
+        self.pool.try_send_via_all(buf, addr);
+    }
+
+    /// Sends through the matching-family main UDP socket.
+    pub fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<()> {
+        self.pool.send_to(buf, addr)
+    }
+
+    /// Sends through every assistant UDP socket. IPv6 targets are ignored.
+    pub fn try_send_via_assistants(&self, buf: &[u8], addr: SocketAddr) -> io::Result<()> {
+        self.pool.try_send_via_assistants(buf, addr)
+    }
+
+    /// Returns the local address of the main IPv4 UDP socket.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.pool.local_addr()
+    }
+
+    /// Returns the current number of assistant UDP sockets.
+    pub fn assistant_count(&self) -> usize {
+        self.pool.assistant_count()
+    }
+
+    /// Returns all UDP sockets: main IPv4, optional main IPv6, then assistants.
+    pub fn udp_sockets(&self) -> Vec<Arc<tokio::net::UdpSocket>> {
+        self.pool.udp_sockets()
+    }
+
+    /// Gets NAT information using the STUN and mapping configuration captured
+    /// when this puncher was created.
+    pub async fn nat_info(&self) -> io::Result<NatInfo> {
+        let stun_result = crate::stun::stun_test_nat(
+            self.nat_config.stun_servers.clone(),
+            self.nat_config.default_interface.as_ref(),
+        )
+        .await?;
+
+        log::debug!(
+            "nat_type:{:?},public_ipv4:{:?},public_ipv6:{:?},public_udp_ports:{:?},port_range:{}",
+            stun_result.nat_type,
+            stun_result.public_ipv4,
+            stun_result.public_ipv6,
+            stun_result.public_udp_ports,
+            stun_result.port_range
+        );
+
+        let local_ipv4 = crate::util::addr::local_ipv4()
+            .await
+            .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+        let local_udp_ports = self
+            .pool
+            .udp_sockets()
+            .iter()
+            .filter_map(|socket| socket.local_addr().ok().map(|addr| addr.port()))
+            .collect();
+
+        // STUN uses a temporary UDP socket, so its mapped ports do not belong
+        // to the actual tunnel sockets. Real mapped ports are learned later by
+        // the higher-level NAT observation protocol.
+        Ok(NatInfo {
+            nat_type: stun_result.nat_type,
+            public_ips: stun_result.public_ipv4,
+            public_udp_ports: Vec::new(),
+            mapping_tcp_addr: self.nat_config.mapping_tcp_addr.clone(),
+            mapping_udp_addr: self.nat_config.mapping_udp_addr.clone(),
+            public_port_range: stun_result.port_range,
+            local_ipv4,
+            local_ipv4s: vec![],
+            ipv6: None,
+            local_udp_ports,
+            local_tcp_port: self.nat_config.local_tcp_port,
+            public_tcp_port: 0,
+            stun_mapped_ports: Vec::new(),
+        })
+    }
+
+    /// Applies the socket model for an externally detected local NAT type.
+    ///
+    /// This method does not run STUN or otherwise detect the NAT type. Call
+    /// [`Self::nat_info`] or another detector first, then pass its result here.
+    ///
+    /// - [`NatType::Symmetric`] adds assistant sockets up to the configured
+    ///   `max_assistant_sockets` value.
+    /// - [`NatType::Cone`] removes all assistant sockets.
+    pub fn apply_nat_model(&self, nat_type: NatType) -> io::Result<()> {
+        let _model_guard = self.pool.lock_assistant_model();
+        match nat_type {
+            NatType::Symmetric => {
+                let current = self.pool.assistant_count();
+                let target = self.nat_config.max_assistant_sockets;
+                if target > current {
+                    log::debug!(
+                        "Symmetric NAT model selected, adding {} assistant sockets",
+                        target - current
+                    );
+                    for _ in current..target {
+                        let socket = crate::socket::bind_udp("0.0.0.0:0".parse().unwrap(), None)?;
+                        let std_socket: std::net::UdpSocket = socket.into();
+                        let tokio_socket = tokio::net::UdpSocket::from_std(std_socket)?;
+                        self.pool.add_assistant_udp(tokio_socket);
+                    }
+                }
+            }
+            NatType::Cone => {
+                let count = self.pool.assistant_count();
+                if count > 0 {
+                    log::debug!("Cone NAT model selected, cleaning {count} assistant sockets");
+                    self.pool.clean_assistant_udp();
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Returns whether a new punch round should be started for the peer,
@@ -212,13 +357,8 @@ impl Puncher {
     ) {
         match tokio::time::timeout(timeout, async {
             let stream = crate::socket::connect_tcp(addr, 0, None, ttl).await?;
-            let weak = pool.add_tcp(stream, addr)?;
-            if let Some(data) = buf {
-                if let Some(conn) = weak.upgrade() {
-                    let _ = conn.send(data).await;
-                }
-            }
-            Ok::<(), io::Error>(())
+            let initial_data = buf.map(Bytes::copy_from_slice);
+            pool.publish_tcp(stream, addr, initial_data).await
         })
         .await
         {

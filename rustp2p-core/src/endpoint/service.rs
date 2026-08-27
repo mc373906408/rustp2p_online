@@ -1,71 +1,66 @@
 use crate::endpoint::config::Config;
 use crate::endpoint::pool::SocketPool;
-use crate::endpoint::transport::Transport;
-use bytes::BytesMut;
+use crate::endpoint::tunnel::Tunnel;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 
-/// A received message with data and source transport.
-pub struct Received {
-    /// The received data (already framed for TCP). Mutable: freeze it with
-    /// [`BytesMut::freeze`] if an immutable `Bytes` is preferred.
-    pub data: BytesMut,
-    /// The source transport (can be used to send back).
-    pub transport: Transport,
-}
-
-/// The main P2P endpoint for sending and receiving data.
+/// Binds the shared UDP sockets and TCP listener and yields logical tunnels.
 ///
 /// # Examples
 ///
 /// ```rust,no_run
 /// use bytes::Bytes;
-/// use rustp2p_core::endpoint::{EndPoint, Config};
+/// use rustp2p_core::endpoint::{Config, TunnelIncoming};
 ///
 /// # #[tokio::main]
 /// # async fn main() -> std::io::Result<()> {
-/// let mut ep = EndPoint::bind(Config::new().udp_port(3000)).await?;
-/// println!("Listening on: {:?}", ep.local_addr());
+/// let mut incoming = TunnelIncoming::bind(Config::new().udp_port(3000)).await?;
+/// println!("Listening on: {:?}", incoming.local_addr());
 ///
-/// while let Some(received) = ep.recv().await {
-///     println!("From {}: {:?}", received.transport.remote_addr(), received.data);
-///     received.transport.send(Bytes::from_static(b"echo")).await?;
+/// while let Some(mut tunnel) = incoming.next().await {
+///     tokio::spawn(async move {
+///         while let Some(data) = tunnel.recv().await {
+///             println!("From {}: {:?}", tunnel.remote_addr(), data);
+///             tunnel.send(Bytes::from_static(b"echo")).await?;
+///         }
+///         Ok::<_, std::io::Error>(())
+///     });
 /// }
 /// # Ok(())
 /// # }
 /// ```
-pub struct EndPoint {
+pub struct TunnelIncoming {
     pool: Arc<SocketPool>,
-    data_rx: mpsc::Receiver<(Transport, BytesMut)>,
+    tunnel_rx: mpsc::Receiver<Tunnel>,
     config: Config,
     local_tcp_port: u16,
 }
 
-impl EndPoint {
-    /// Binds an endpoint with the given configuration.
+impl TunnelIncoming {
+    /// Binds an incoming tunnel source with the given configuration.
     pub async fn bind(mut config: Config) -> io::Result<Self> {
         let codec: Box<dyn crate::endpoint::codec::InitCodec> = config
             .tcp_codec
             .take()
             .unwrap_or_else(|| Box::new(crate::endpoint::codec::LengthPrefixedInitCodec));
 
-        let (data_tx, data_rx) = mpsc::channel(512);
+        let (accept_tx, tunnel_rx) = mpsc::channel(512);
         let (main_v4, main_v6) =
             bind_main_udp(config.udp_port.unwrap_or(0), config.enable_ipv6).await?;
         let pool = Arc::new(SocketPool::new(
             main_v4,
             main_v6,
-            data_tx,
+            accept_tx,
             codec.clone(),
             config.max_udp_datagram_size,
         ));
 
         let tcp_listener = if let Some(port) = config.tcp_port {
-            let addr = format!("0.0.0.0:{port}");
-            Some(TcpListener::bind(&addr).await?)
+            let udp_port = pool.local_addr()?.port();
+            Some(bind_tcp(port, udp_port).await?)
         } else {
             None
         };
@@ -76,25 +71,25 @@ impl EndPoint {
             .map(|a| a.port())
             .unwrap_or(0);
 
-        let ep = Self {
+        let incoming = Self {
             pool,
-            data_rx,
+            tunnel_rx,
             config,
             local_tcp_port,
         };
 
         // Start TCP accept loop
-        if let Some(listener) = tcp_listener {
-            let pool = ep.pool.clone();
+        if let Some(tcp_listener) = tcp_listener {
+            let pool = incoming.pool.clone();
             let mut shutdown_rx = pool.shutdown_rx();
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
-                        result = listener.accept() => {
+                        result = tcp_listener.accept() => {
                             match result {
                                 Ok((stream, peer_addr)) => {
                                     log::debug!("TCP connection from {peer_addr}");
-                                    if let Err(e) = pool.add_tcp(stream, peer_addr) {
+                                    if let Err(e) = pool.publish_tcp(stream, peer_addr, None).await {
                                         log::warn!("TCP setup error: {e}");
                                     }
                                 }
@@ -116,16 +111,16 @@ impl EndPoint {
             });
         }
 
-        Ok(ep)
+        Ok(incoming)
     }
 
-    /// Receives the next message from any peer.
-    pub async fn recv(&mut self) -> Option<Received> {
-        let (transport, data) = self.data_rx.recv().await?;
-        Some(Received { data, transport })
+    /// Returns the next UDP five-tuple or inbound/punched TCP connection, or
+    /// `None` after the incoming source is closed.
+    pub async fn next(&mut self) -> Option<Tunnel> {
+        self.tunnel_rx.recv().await
     }
 
-    /// Returns the local address this endpoint is bound to.
+    /// Returns the local address this incoming source is bound to.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.pool.local_addr()
     }
@@ -135,19 +130,11 @@ impl EndPoint {
         &self.config
     }
 
-    /// Returns a Sender handle for sending data and querying socket state.
-    ///
-    /// `Sender` is lightweight and cloneable. It provides send methods
-    /// and read-only query methods without exposing internal socket management.
-    pub fn sender(&self) -> super::pool::Sender {
-        super::pool::Sender(self.pool.clone())
-    }
-
     /// Returns a Puncher for NAT hole-punching.
     ///
-    /// The Puncher is constructed using the endpoint's internal socket pool.
+    /// The handle also provides raw UDP sends, socket queries, and NAT discovery.
     pub fn puncher(&self) -> crate::punch::Puncher {
-        crate::punch::Puncher::new(self.pool.clone())
+        crate::punch::Puncher::new(self.pool.clone(), &self.config, self.local_tcp_port)
     }
 
     /// Get local UDP ports.
@@ -163,102 +150,11 @@ impl EndPoint {
     pub fn local_tcp_port(&self) -> u16 {
         self.local_tcp_port
     }
-
-    /// Get NAT information using configured STUN servers.
-    ///
-    /// Uses the stun servers from Config to detect NAT type and public addresses.
-    pub async fn nat_info(&self) -> io::Result<crate::nat::NatInfo> {
-        let stun_servers = self.config.stun_servers.clone();
-        let default_interface = self.config.default_interface.as_ref();
-
-        let stun_result = crate::stun::stun_test_nat(stun_servers, default_interface).await?;
-
-        log::debug!(
-            "nat_type:{:?},public_ipv4:{:?},public_ipv6:{:?},public_udp_ports:{:?},port_range:{}",
-            stun_result.nat_type,
-            stun_result.public_ipv4,
-            stun_result.public_ipv6,
-            stun_result.public_udp_ports,
-            stun_result.port_range
-        );
-
-        let local_ipv4 = crate::util::addr::local_ipv4()
-            .await
-            .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
-
-        let local_udp_ports = self.local_udp_ports();
-        let local_tcp_port = self.local_tcp_port();
-
-        // public_udp_ports starts empty — STUN uses a temporary socket so its
-        // mapped ports do NOT correspond to the main QUIC socket.  The real
-        // public ports are discovered via NatObserve (which observes the actual
-        // QUIC connection's source address) and appended later.
-        //
-        // Previously this was `local_udp_ports.clone()` then `fill(0)`, which
-        // produced [0, 0, ...].  Those zeros are harmful: in punch_udp's
-        // Symmetric branch, base_port=0 with port_range=N yields a prediction
-        // window of [1, N] (wrong) or [1, 0] (empty), wasting prediction slots.
-        let public_udp_ports: Vec<u16> = Vec::new();
-
-        Ok(crate::nat::NatInfo {
-            nat_type: stun_result.nat_type,
-            public_ips: stun_result.public_ipv4,
-            public_udp_ports,
-            mapping_tcp_addr: self.config.mapping_tcp_addr.clone(),
-            mapping_udp_addr: self.config.mapping_udp_addr.clone(),
-            public_port_range: stun_result.port_range,
-            local_ipv4,
-            local_ipv4s: vec![],
-            ipv6: None,
-            local_udp_ports,
-            local_tcp_port,
-            public_tcp_port: 0,
-            stun_mapped_ports: Vec::new(),
-        })
-    }
-
-    /// Apply the socket model for an externally detected NAT type.
-    ///
-    /// This method does not run STUN or any other NAT detection. Call
-    /// [`nat_info`](Self::nat_info) or your own detector first, then pass the
-    /// resulting [`NatType`](crate::nat::NatType) here.
-    ///
-    /// - `Symmetric`: add assistant sockets up to `Config::max_assistant_sockets`.
-    /// - `Cone`: remove assistant sockets because extra source ports are not needed.
-    pub fn apply_nat_model(&self, nat_type: crate::nat::NatType) -> io::Result<()> {
-        match nat_type {
-            crate::nat::NatType::Symmetric => {
-                let current = self.pool.assistant_count();
-                let target = self.config.max_assistant_sockets;
-                if target > current {
-                    log::debug!(
-                        "Symmetric NAT model selected, adding {} assistant sockets",
-                        target - current
-                    );
-                    for _ in current..target {
-                        let socket = crate::socket::bind_udp("0.0.0.0:0".parse().unwrap(), None)?;
-                        let std_socket: std::net::UdpSocket = socket.into();
-                        let tokio_socket = tokio::net::UdpSocket::from_std(std_socket)?;
-                        self.pool.add_assistant_udp(tokio_socket);
-                    }
-                }
-            }
-            crate::nat::NatType::Cone => {
-                let count = self.pool.assistant_count();
-                if count > 0 {
-                    log::debug!("Cone NAT model selected, cleaning {count} assistant sockets");
-                    self.pool.clean_assistant_udp();
-                }
-            }
-        }
-
-        Ok(())
-    }
 }
 
-impl std::fmt::Debug for EndPoint {
+impl std::fmt::Debug for TunnelIncoming {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EndPoint").finish_non_exhaustive()
+        f.debug_struct("TunnelIncoming").finish_non_exhaustive()
     }
 }
 
@@ -297,11 +193,8 @@ async fn bind_main_udp(port: u16, enable_ipv6: bool) -> io::Result<(UdpSocket, O
                 }
                 main_v6 = bind_udp_v6(0)?;
             }
-            log::warn!(
-                "failed to pair the main v4/v6 UDP ports after 20 attempts, using IPv4 only"
-            );
             let main_v4 = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?;
-            Ok((main_v4, None))
+            Ok((main_v4, Some(main_v6)))
         }
         Err(e) => {
             log::warn!("IPv6 main socket unavailable, using IPv4 only: {e}");
@@ -335,21 +228,107 @@ fn bind_udp_v6(port: u16) -> io::Result<UdpSocket> {
     UdpSocket::from_std(std_socket)
 }
 
-impl Drop for EndPoint {
+impl Drop for TunnelIncoming {
     fn drop(&mut self) {
         self.pool.shutdown();
     }
 }
 
+/// Bind TCP to the configured port. A zero port first reuses the main UDP
+/// port, keeping the externally visible protocol ports aligned when possible.
+/// Only an address conflict triggers a fallback to an OS-assigned port; other
+/// errors are returned to the caller.
+async fn bind_tcp(configured_port: u16, udp_port: u16) -> io::Result<TcpListener> {
+    let preferred_port = if configured_port == 0 {
+        udp_port
+    } else {
+        configured_port
+    };
+    let preferred_addr = SocketAddr::from(([0, 0, 0, 0], preferred_port));
+
+    match TcpListener::bind(preferred_addr).await {
+        Ok(listener) => Ok(listener),
+        Err(error) if configured_port == 0 && is_tcp_port_conflict(&error) => {
+            log::debug!(
+                "TCP port {preferred_port} is occupied, falling back to an OS-assigned port"
+            );
+            TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_tcp_port_conflict(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::AddrInUse {
+        return true;
+    }
+
+    // Windows can report WSAEACCES instead of WSAEADDRINUSE when another
+    // socket has the port reserved with exclusive address use.
+    #[cfg(windows)]
+    if error.raw_os_error() == Some(10013) {
+        return true;
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
-    use super::EndPoint;
+    use super::TunnelIncoming;
     use crate::endpoint::Config;
     use crate::nat::NatType;
+    use bytes::Bytes;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream, UdpSocket};
+
+    async fn udp_incoming() -> TunnelIncoming {
+        TunnelIncoming::bind(Config::udp(0).enable_ipv6(false))
+            .await
+            .unwrap()
+    }
+
+    fn loopback(addr: SocketAddr) -> SocketAddr {
+        SocketAddr::new("127.0.0.1".parse().unwrap(), addr.port())
+    }
+
+    #[tokio::test]
+    async fn zero_tcp_port_prefers_the_main_udp_port() {
+        let listener =
+            TunnelIncoming::bind(Config::new().udp_port(0).tcp_port(0).enable_ipv6(false))
+                .await
+                .unwrap();
+
+        assert_ne!(listener.local_tcp_port(), 0);
+        assert_eq!(
+            listener.local_tcp_port(),
+            listener.local_addr().unwrap().port()
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_tcp_port_falls_back_when_the_udp_port_is_taken_for_tcp() {
+        let blocker = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let occupied_port = blocker.local_addr().unwrap().port();
+        let listener = TunnelIncoming::bind(
+            Config::new()
+                .udp_port(occupied_port)
+                .tcp_port(0)
+                .enable_ipv6(false),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(listener.local_addr().unwrap().port(), occupied_port);
+        assert_ne!(listener.local_tcp_port(), 0);
+        assert_ne!(listener.local_tcp_port(), occupied_port);
+    }
 
     #[tokio::test]
     async fn apply_nat_model_uses_external_nat_type() {
-        let ep = EndPoint::bind(
+        let listener = TunnelIncoming::bind(
             Config::new()
                 .udp_port(0)
                 .tcp_port(0)
@@ -357,12 +336,218 @@ mod tests {
         )
         .await
         .unwrap();
-        let sender = ep.sender();
+        let puncher = listener.puncher();
 
-        ep.apply_nat_model(NatType::Symmetric).unwrap();
-        assert_eq!(sender.assistant_count(), 2);
+        puncher.apply_nat_model(NatType::Symmetric).unwrap();
+        assert_eq!(puncher.assistant_count(), 2);
 
-        ep.apply_nat_model(NatType::Cone).unwrap();
-        assert_eq!(sender.assistant_count(), 0);
+        puncher.apply_nat_model(NatType::Cone).unwrap();
+        assert_eq!(puncher.assistant_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn puncher_owns_udp_socket_queries_and_nat_info() {
+        let mapping_tcp_addr: SocketAddr = "127.0.0.1:41000".parse().unwrap();
+        let mapping_udp_addr: SocketAddr = "127.0.0.1:42000".parse().unwrap();
+        let listener = TunnelIncoming::bind(
+            Config::new()
+                .udp_port(0)
+                .tcp_port(0)
+                .enable_ipv6(false)
+                .mapping_tcp_addr(vec![mapping_tcp_addr])
+                .mapping_udp_addr(vec![mapping_udp_addr]),
+        )
+        .await
+        .unwrap();
+        let puncher = listener.puncher();
+
+        assert_eq!(
+            puncher.local_addr().unwrap(),
+            listener.local_addr().unwrap()
+        );
+        assert_eq!(puncher.assistant_count(), 0);
+        assert_eq!(puncher.udp_sockets().len(), 1);
+
+        let nat_info = puncher.nat_info().await.unwrap();
+        assert_eq!(nat_info.mapping_tcp_addr, vec![mapping_tcp_addr]);
+        assert_eq!(nat_info.mapping_udp_addr, vec![mapping_udp_addr]);
+        assert_eq!(nat_info.local_tcp_port, listener.local_tcp_port());
+        assert_eq!(nat_info.local_udp_ports, listener.local_udp_ports());
+    }
+
+    #[tokio::test]
+    async fn udp_five_tuples_are_accepted_once_and_demultiplexed() {
+        let mut listener = udp_incoming().await;
+        let target = loopback(listener.local_addr().unwrap());
+        let client_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        client_a.send_to(b"a1", target).await.unwrap();
+        let mut tunnel_a = listener.next().await.unwrap();
+        assert_eq!(tunnel_a.remote_addr(), client_a.local_addr().unwrap());
+        assert_eq!(&tunnel_a.recv().await.unwrap()[..], b"a1");
+
+        client_b.send_to(b"b1", target).await.unwrap();
+        let mut tunnel_b = listener.next().await.unwrap();
+        assert_eq!(tunnel_b.remote_addr(), client_b.local_addr().unwrap());
+        assert_eq!(&tunnel_b.recv().await.unwrap()[..], b"b1");
+
+        client_a.send_to(b"a2", target).await.unwrap();
+        client_b.send_to(b"b2", target).await.unwrap();
+        assert_eq!(&tunnel_a.recv().await.unwrap()[..], b"a2");
+        assert_eq!(&tunnel_b.recv().await.unwrap()[..], b"b2");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.next())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_udp_tunnel_allows_same_tuple_to_be_accepted_again() {
+        let mut listener = udp_incoming().await;
+        let target = loopback(listener.local_addr().unwrap());
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        client.send_to(b"first", target).await.unwrap();
+        let mut first = listener.next().await.unwrap();
+        assert_eq!(&first.recv().await.unwrap()[..], b"first");
+        let route_key = first.route_key();
+        drop(first);
+
+        client.send_to(b"second", target).await.unwrap();
+        let mut second = listener.next().await.unwrap();
+        assert_eq!(second.route_key(), route_key);
+        assert_eq!(&second.recv().await.unwrap()[..], b"second");
+    }
+
+    #[tokio::test]
+    async fn udp_tunnel_split_supports_independent_read_and_write_halves() {
+        let mut listener = udp_incoming().await;
+        let target = loopback(listener.local_addr().unwrap());
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        client.send_to(b"open", target).await.unwrap();
+        let tunnel = listener.next().await.unwrap();
+        let route_key = tunnel.route_key();
+        let (mut reader, writer) = tunnel.split();
+        assert_eq!(reader.route_key(), route_key);
+        assert_eq!(writer.route_key(), route_key);
+        assert_eq!(&reader.recv().await.unwrap()[..], b"open");
+
+        writer.send(Bytes::from_static(b"reply")).await.unwrap();
+        let mut buffer = [0_u8; 16];
+        let (len, peer) = client.recv_from(&mut buffer).await.unwrap();
+        assert_eq!(peer, target);
+        assert_eq!(&buffer[..len], b"reply");
+
+        // Dropping only the reader unregisters the five-tuple. The independent
+        // writer remains usable, while the next inbound packet creates a new tunnel.
+        drop(reader);
+        writer
+            .send(Bytes::from_static(b"still-open"))
+            .await
+            .unwrap();
+        client.recv_from(&mut buffer).await.unwrap();
+        client.send_to(b"reopen", target).await.unwrap();
+        let mut reopened = listener.next().await.unwrap();
+        assert_eq!(reopened.route_key(), route_key);
+        assert_eq!(&reopened.recv().await.unwrap()[..], b"reopen");
+    }
+
+    #[tokio::test]
+    async fn full_udp_tunnel_does_not_block_other_five_tuples() {
+        let mut listener = udp_incoming().await;
+        let target = loopback(listener.local_addr().unwrap());
+        let slow_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fast_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        slow_client.send_to(b"start", target).await.unwrap();
+        let _slow_tunnel = listener.next().await.unwrap();
+        for _ in 0..crate::endpoint::tunnel::TUNNEL_CHANNEL_CAPACITY + 64 {
+            slow_client.send_to(b"overflow", target).await.unwrap();
+        }
+
+        fast_client.send_to(b"fast", target).await.unwrap();
+        let mut fast_tunnel = tokio::time::timeout(Duration::from_secs(1), listener.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fast_tunnel.remote_addr(), fast_client.local_addr().unwrap());
+        assert_eq!(&fast_tunnel.recv().await.unwrap()[..], b"fast");
+    }
+
+    #[tokio::test]
+    async fn tcp_accept_and_drop_follow_tunnel_lifetime() {
+        let mut server = TunnelIncoming::bind(Config::tcp(0).enable_ipv6(false))
+            .await
+            .unwrap();
+        let target = SocketAddr::new("127.0.0.1".parse().unwrap(), server.local_tcp_port());
+
+        let mut client = TcpStream::connect(target).await.unwrap();
+        let mut server_tunnel = server.next().await.unwrap();
+        assert!(server_tunnel.is_tcp());
+
+        client.write_all(&6_u32.to_be_bytes()).await.unwrap();
+        client.write_all(b"client").await.unwrap();
+        assert_eq!(&server_tunnel.recv().await.unwrap()[..], b"client");
+        server_tunnel
+            .send(Bytes::from_static(b"server"))
+            .await
+            .unwrap();
+        let mut header = [0_u8; 4];
+        client.read_exact(&mut header).await.unwrap();
+        assert_eq!(u32::from_be_bytes(header), 6);
+        let mut payload = [0_u8; 6];
+        client.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"server");
+
+        drop(client);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), server_tunnel.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_incoming_closes_udp_tunnels() {
+        let mut listener = udp_incoming().await;
+        let target = loopback(listener.local_addr().unwrap());
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(b"open", target).await.unwrap();
+        let mut tunnel = listener.next().await.unwrap();
+        assert_eq!(&tunnel.recv().await.unwrap()[..], b"open");
+
+        drop(listener);
+        assert!(tokio::time::timeout(Duration::from_secs(1), tunnel.recv())
+            .await
+            .unwrap()
+            .is_none());
+        tokio::task::yield_now().await;
+        assert!(tunnel.send(Bytes::from_static(b"closed")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn removing_assistant_socket_closes_its_udp_tunnels() {
+        let mut listener =
+            TunnelIncoming::bind(Config::udp(0).enable_ipv6(false).max_assistant_sockets(1))
+                .await
+                .unwrap();
+        let puncher = listener.puncher();
+        puncher.apply_nat_model(NatType::Symmetric).unwrap();
+        let sockets = puncher.udp_sockets();
+        let target = loopback(sockets[1].local_addr().unwrap());
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(b"assistant", target).await.unwrap();
+        let mut tunnel = listener.next().await.unwrap();
+        assert_eq!(&tunnel.recv().await.unwrap()[..], b"assistant");
+
+        puncher.apply_nat_model(NatType::Cone).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), tunnel.recv())
+            .await
+            .unwrap()
+            .is_none());
     }
 }

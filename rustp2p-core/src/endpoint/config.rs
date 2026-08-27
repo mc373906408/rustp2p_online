@@ -17,7 +17,7 @@ pub enum LoadBalance {
 /// Default maximum UDP datagram size (full 64 KiB, accepts any datagram).
 pub const DEFAULT_MAX_UDP_DATAGRAM_SIZE: usize = 65_536;
 
-/// Main configuration for creating an EndPoint.
+/// Main configuration for creating a [`TunnelIncoming`](super::TunnelIncoming).
 pub struct Config {
     pub(crate) stun_servers: Vec<String>,
     pub(crate) udp_port: Option<u16>,
@@ -32,7 +32,7 @@ pub struct Config {
     /// Whether to also bind a main IPv6 UDP socket. When true but the system
     /// has no IPv6 support, binding silently falls back to IPv4 only.
     pub(crate) enable_ipv6: bool,
-    /// Maximum UDP datagram size the endpoint can receive.
+    /// Maximum UDP datagram size the listener can receive.
     pub(crate) max_udp_datagram_size: usize,
 }
 
@@ -81,6 +81,9 @@ impl Config {
         self
     }
 
+    /// Enables TCP on `port`. When `port` is zero, binding first tries the
+    /// actual main UDP port and falls back to an OS-assigned port if that TCP
+    /// port is already occupied.
     pub fn tcp_port(mut self, port: u16) -> Self {
         self.tcp_port = Some(port);
         self
@@ -132,7 +135,7 @@ impl Config {
         self
     }
 
-    /// Set the maximum UDP datagram size the endpoint can receive; larger
+    /// Set the maximum UDP datagram size the listener can receive; larger
     /// datagrams are truncated. Defaults to 65536 (accepts anything).
     ///
     /// Lower it to what the application actually uses (e.g. 2048) to cut

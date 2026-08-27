@@ -12,7 +12,7 @@ flowchart TD
     quic["quic module<br/>quinn, TLS, synthetic addresses"]
     protocol["protocol module<br/>wire packets, discovery, relay, punch"]
     transport["transport module<br/>rustp2p-core, confirmed routes"]
-    core["rustp2p-core<br/>UDP/TCP transports"]
+    core["rustp2p-core<br/>UDP/TCP tunnels"]
     network["Network links"]
 
     app --> endpoint
@@ -39,9 +39,11 @@ The transport layer wraps `rustp2p-core::endpoint` and owns the confirmed
 destination `PeerId` or a specific `RouteKey`.
 
 Receiving a packet from `rustp2p-core` does not confirm a route. The transport
-receiver caches `RouteKey -> core Transport` handles only so later confirmed
-routes can reuse live send handles. The raw bytes and source `RouteKey` are
-passed to the protocol layer for interpretation.
+receiver starts one actor per accepted core `Tunnel` and caches the actor's
+`RouteKey -> outbound sender` while it remains live. The actor passes raw bytes
+and their source `RouteKey` to the protocol layer for interpretation. UDP and
+TCP actors close after `Config::tunnel_idle_timeout` without inbound data;
+outbound-only traffic does not refresh this read-idle lease.
 
 ### Protocol
 

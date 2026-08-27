@@ -23,7 +23,7 @@
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
-use crate::endpoint::transport::Transport;
+use crate::endpoint::tunnel::Tunnel;
 
 mod table;
 
@@ -49,8 +49,8 @@ pub const DEFAULT_RTT: u32 = 9999;
 ///     "127.0.0.1:3000".parse().unwrap(),
 /// );
 ///
-/// // Or from a Transport
-/// // let key = transport.route_key();
+/// // Or from a Tunnel
+/// // let key = tunnel.route_key();
 /// # }
 /// ```
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug)]
@@ -78,12 +78,12 @@ impl RouteKey {
         }
     }
 
-    /// Creates a RouteKey from a Transport handle.
-    pub fn from_transport(transport: &Transport) -> Self {
+    /// Creates a RouteKey from a Tunnel.
+    pub fn from_tunnel(tunnel: &Tunnel) -> Self {
         Self {
-            protocol: transport.protocol(),
-            local_addr: transport.local_addr(),
-            peer_addr: transport.remote_addr(),
+            protocol: tunnel.protocol(),
+            local_addr: tunnel.local_addr(),
+            peer_addr: tunnel.remote_addr(),
         }
     }
 

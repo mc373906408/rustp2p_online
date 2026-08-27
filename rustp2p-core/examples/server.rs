@@ -1,7 +1,8 @@
 use bytes::{BufMut, BytesMut};
 use clap::Parser;
 use env_logger::Env;
-use rustp2p_core::endpoint::{Config, EndPoint, Sender};
+use rustp2p_core::endpoint::{Config, Tunnel, TunnelIncoming};
+use rustp2p_core::punch::Puncher;
 use rustp2p_core::route_table::RouteTable;
 
 /*Demo Protocol
@@ -41,32 +42,34 @@ async fn main() {
     let args = Args::parse();
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
-    let mut ep = EndPoint::bind(Config::new().udp_port(args.port).tcp_port(args.port))
+    let mut incoming = TunnelIncoming::bind(Config::new().udp_port(args.port).tcp_port(args.port))
         .await
         .unwrap();
 
     let route_table: RouteTable<u32> = RouteTable::default();
-    let sender = ep.sender();
+    let puncher = incoming.puncher();
 
-    log::info!("Server listening on {:?}", ep.local_addr());
+    log::info!("Server listening on {:?}", incoming.local_addr());
 
-    while let Some(received) = ep.recv().await {
+    while let Some(mut tunnel) = incoming.next().await {
         let route_table = route_table.clone();
-        let sender = sender.clone();
+        let puncher = puncher.clone();
         tokio::spawn(async move {
-            handler(route_table, received, sender).await;
+            while let Some(data) = tunnel.recv().await {
+                handler(&route_table, &tunnel, data, &puncher).await;
+            }
         });
     }
 }
 
 async fn handler(
-    route_table: RouteTable<u32>,
-    received: rustp2p_core::endpoint::Received,
-    sender: Sender,
+    route_table: &RouteTable<u32>,
+    tunnel: &Tunnel,
+    data: BytesMut,
+    puncher: &Puncher,
 ) {
-    let data = &received.data;
-    let addr = received.transport.remote_addr();
-    let route_key = received.transport.route_key();
+    let addr = tunnel.remote_addr();
+    let route_key = tunnel.route_key();
 
     if data.len() < HEAD_LEN {
         log::warn!("invalid protocol {:?}", &data[..]);
@@ -102,13 +105,13 @@ async fn handler(
                 .unwrap();
                 response.extend_from_slice(json.as_bytes());
                 let peer_addr = peer_route.route_key().peer_addr();
-                let _ = sender.send_to(response.freeze().as_ref(), peer_addr);
+                let _ = puncher.send_to(response.freeze().as_ref(), peer_addr);
             }
         }
         PUNCH_START_1 | PUNCH_START_2 => match route_table.get_route_by_id(&dest_id) {
             Ok(route) => {
                 let peer_addr = route.route_key().peer_addr();
-                let _ = sender.send_to(data.as_ref(), peer_addr);
+                let _ = puncher.send_to(data.as_ref(), peer_addr);
             }
             Err(e) => {
                 log::warn!(
@@ -122,7 +125,7 @@ async fn handler(
             response.put_u32(MY_SERVER_ID);
             response.put_u32(src_id);
             response.extend_from_slice(addr.to_string().as_bytes());
-            let _ = sender.send_to(response.freeze().as_ref(), addr);
+            let _ = puncher.send_to(response.freeze().as_ref(), addr);
         }
         _ => {
             log::warn!(
