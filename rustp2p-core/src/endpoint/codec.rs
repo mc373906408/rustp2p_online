@@ -95,6 +95,15 @@ impl Decoder for LengthPrefixedCodec {
 
 impl Encoder for LengthPrefixedCodec {
     fn encode<'a>(&'a mut self, data: &'a [u8], iov: &mut Vec<IoSlice<'a>>) -> io::Result<()> {
+        // Enforce the same MAX_FRAME_LEN limit as the decoder: sending a
+        // larger frame would make the peer close the connection with no
+        // error reported on this side.
+        if data.len() > MAX_FRAME_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("frame too large: {}", data.len()),
+            ));
+        }
         let len = u32::try_from(data.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame too large"))?;
         self.head = len.to_be_bytes();
