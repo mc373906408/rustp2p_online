@@ -59,6 +59,12 @@ pub struct Puncher {
     pool: Arc<SocketPool>,
 }
 
+/// Upper bound for the per-peer punch bookkeeping maps (`punch_stats` and
+/// `port_cursor`). When a map is full, it is cleared wholesale: entries are
+/// small and the occasional backoff/cursor reset is preferable to unbounded
+/// growth on long-lived nodes.
+const MAX_PUNCH_ENTRIES: usize = 4096;
+
 impl Puncher {
     pub fn new(pool: Arc<SocketPool>) -> Puncher {
         let mut shuffled_ports: Vec<u16> = (1..=65535).collect();
@@ -77,7 +83,14 @@ impl Puncher {
         let Some(id) = punch_info.peer_nat_info.flag() else {
             return false;
         };
-        let stats = self.punch_stats.lock().entry(id).or_default().clone();
+        // Read-only query: do not create an entry here, otherwise mere
+        // lookups would grow the map without bound.
+        let stats = self
+            .punch_stats
+            .lock()
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
         should_punch(&stats, now())
     }
 
@@ -121,6 +134,9 @@ impl Puncher {
         );
         {
             let mut stats = self.punch_stats.lock();
+            if !stats.contains_key(&peer) && stats.len() >= MAX_PUNCH_ENTRIES {
+                stats.clear();
+            }
             let entry = stats.entry(peer).or_default();
             entry.batch_count += 1;
             entry.last_time = now();
@@ -341,7 +357,11 @@ impl Puncher {
                     if index >= self.shuffled_ports.len() {
                         index = 0;
                     }
-                    self.port_cursor.lock().insert(cursor_key, index);
+                    let mut cursor = self.port_cursor.lock();
+                    if !cursor.contains_key(&cursor_key) && cursor.len() >= MAX_PUNCH_ENTRIES {
+                        cursor.clear();
+                    }
+                    cursor.insert(cursor_key, index);
                 }
                 NatType::Cone => {
                     // Send to ALL known public addresses, not just the first
