@@ -311,14 +311,19 @@ impl Puncher {
                 // Phase 2: Global random scan — send to random ports across
                 // the full 1-65535 range.  The cursor persists across punch
                 // attempts so we don't re-scan the same ports every time.
-                let default_addr =
-                    SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0));
-                let pub_addr = peer_nat_info
-                    .public_ipv4_addr()
-                    .into_iter()
-                    .next()
-                    .unwrap_or(default_addr);
-                let start = self.port_cursor.lock().get(&pub_addr).copied().unwrap_or(0);
+                // Key the scan cursor by the peer's first public IP (the
+                // port part is irrelevant). public_ipv4_addr() cannot be
+                // used as the key: it is empty while no public UDP port is
+                // known and changes as ports are observed, which lost the
+                // cursor and restarted the global scan from the beginning
+                // every round. pub_ips is guaranteed non-empty here.
+                let cursor_key = SocketAddr::V4(SocketAddrV4::new(pub_ips[0], 0));
+                let start = self
+                    .port_cursor
+                    .lock()
+                    .get(&cursor_key)
+                    .copied()
+                    .unwrap_or(0);
                 let end = (start + max_k2).min(self.shuffled_ports.len());
                 log::debug!(
                     "punch_symmetric phase 2: global scan {} ports (range [{}, {}))",
@@ -333,9 +338,7 @@ impl Puncher {
                 if index >= self.shuffled_ports.len() {
                     index = 0;
                 }
-                if let Some(addr) = peer_nat_info.public_ipv4_addr().into_iter().next() {
-                    self.port_cursor.lock().insert(addr, index);
-                }
+                self.port_cursor.lock().insert(cursor_key, index);
             }
             NatType::Cone => {
                 // Send to ALL known public addresses, not just the first
