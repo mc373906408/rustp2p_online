@@ -255,7 +255,12 @@ impl SocketPool {
                                     match decoder.decode(&mut buf) {
                                         Ok(Some(data)) => {
                                             let route = super::transport::Transport::tcp(conn_write_tx.clone(), local_addr, peer_addr);
-                                            let _ = data_tx.send((route, data)).await;
+                                            // The receiver is gone (endpoint dropped):
+                                            // stop reading instead of spinning and
+                                            // discarding frames, same as the UDP reader.
+                                            if data_tx.send((route, data)).await.is_err() {
+                                                break 'read;
+                                            }
                                         }
                                         Ok(None) => break,
                                         Err(e) => {
