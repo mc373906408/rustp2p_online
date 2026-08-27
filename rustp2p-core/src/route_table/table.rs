@@ -429,7 +429,13 @@ impl<PeerID: Hash + Eq + Clone> RouteTable<PeerID> {
                     return true;
                 }
                 x.metric = route.metric;
-                x.rtt = route.rtt;
+                // Preserve a previously measured RTT: callers commonly
+                // rebuild the Route with the DEFAULT_RTT sentinel (e.g. on
+                // route confirmation), which must not erase the real
+                // measurement written by update_rtt.
+                if route.rtt != DEFAULT_RTT {
+                    x.rtt = route.rtt;
+                }
                 exist_index = Some(index);
                 break;
             }
