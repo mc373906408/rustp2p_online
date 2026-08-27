@@ -117,6 +117,10 @@ impl EndPoint {
                                 }
                                 Err(e) => {
                                     log::warn!("TCP accept error: {e}");
+                                    // Back off on persistent errors (e.g. fd
+                                    // exhaustion) so the loop does not spin at
+                                    // 100% CPU and flood the logs.
+                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                 }
                             }
                         }
