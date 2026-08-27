@@ -268,7 +268,7 @@ impl CoreTransportLayer {
                         if this
                             .raw_tx
                             .send_async(RawTransportPacket {
-                                data: received.data,
+                                data: received.data.freeze(),
                                 route_key,
                             })
                             .await

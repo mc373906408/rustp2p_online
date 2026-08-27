@@ -1,7 +1,7 @@
 use std::io::{self, IoSlice};
 use std::net::SocketAddr;
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BytesMut};
 use dyn_clone::DynClone;
 
 /// Maximum payload size of a single length-prefixed frame.
@@ -18,11 +18,13 @@ dyn_clone::clone_trait_object!(InitCodec);
 /// The read task appends bytes received from the stream to `buf` and calls
 /// `decode` in a loop until it returns `Ok(None)`:
 /// - `Ok(Some(frame))`: one complete frame was consumed from the front of
-///   `buf`. The returned [`Bytes`] is zero-copy, it shares `buf`'s allocation.
+///   `buf`. The returned [`BytesMut`] is zero-copy, it shares `buf`'s
+///   allocation, so the downstream may modify it in place; call
+///   [`BytesMut::freeze`] if an immutable `Bytes` is preferred.
 /// - `Ok(None)`: more bytes are needed; unconsumed bytes stay in `buf`.
 /// - `Err(_)`: unrecoverable framing error, the connection is closed.
 pub trait Decoder: Send {
-    fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<Bytes>>;
+    fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<BytesMut>>;
 }
 
 /// Encoder for writing framed data.
@@ -40,11 +42,11 @@ pub trait Encoder: Send {
 pub struct BytesCodec;
 
 impl Decoder for BytesCodec {
-    fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<Bytes>> {
+    fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<BytesMut>> {
         if buf.is_empty() {
             return Ok(None);
         }
-        Ok(Some(buf.split().freeze()))
+        Ok(Some(buf.split()))
     }
 }
 
@@ -72,7 +74,7 @@ pub struct LengthPrefixedCodec {
 }
 
 impl Decoder for LengthPrefixedCodec {
-    fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<Bytes>> {
+    fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<BytesMut>> {
         if buf.len() < 4 {
             return Ok(None);
         }
@@ -89,7 +91,7 @@ impl Decoder for LengthPrefixedCodec {
             return Ok(None);
         }
         buf.advance(4);
-        Ok(Some(buf.split_to(len).freeze()))
+        Ok(Some(buf.split_to(len)))
     }
 }
 

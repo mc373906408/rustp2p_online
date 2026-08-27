@@ -50,7 +50,7 @@ pub struct SocketPool {
     main_udp_v6: Option<Arc<UdpSocket>>,
     assistant_udp: parking_lot::RwLock<Vec<UdpEntry>>,
     tcp_conns: parking_lot::RwLock<HashMap<SocketAddr, Arc<TcpConnection>>>,
-    data_tx: mpsc::Sender<(super::transport::Transport, Bytes)>,
+    data_tx: mpsc::Sender<(super::transport::Transport, BytesMut)>,
     /// Global shutdown - kills ALL tasks (main + sub)
     global_shutdown: broadcast::Sender<()>,
     init_codec: Box<dyn InitCodec>,
@@ -67,7 +67,7 @@ impl SocketPool {
         main_udp_v6: Option<UdpSocket>,
         init_codec: Box<dyn InitCodec>,
         max_udp_datagram_size: usize,
-    ) -> (Self, mpsc::Receiver<(super::transport::Transport, Bytes)>) {
+    ) -> (Self, mpsc::Receiver<(super::transport::Transport, BytesMut)>) {
         let (data_tx, data_rx) = mpsc::channel(512);
         let (global_shutdown, _) = broadcast::channel(4);
 
@@ -101,7 +101,7 @@ impl SocketPool {
     /// Spawn the read and write tasks for one UDP socket.
     fn spawn_udp_tasks(
         socket: Arc<UdpSocket>,
-        data_tx: &mpsc::Sender<(super::transport::Transport, Bytes)>,
+        data_tx: &mpsc::Sender<(super::transport::Transport, BytesMut)>,
         global_shutdown: &broadcast::Sender<()>,
         max_udp_datagram_size: usize,
     ) {
@@ -434,7 +434,7 @@ impl SocketPool {
     async fn run_udp_reader(
         socket: Arc<UdpSocket>,
         write_tx: mpsc::Sender<(Bytes, SocketAddr)>,
-        data_tx: mpsc::Sender<(super::transport::Transport, Bytes)>,
+        data_tx: mpsc::Sender<(super::transport::Transport, BytesMut)>,
         global_shutdown_rx: &mut broadcast::Receiver<()>,
         socket_shutdown_rx: &mut broadcast::Receiver<()>,
         max_udp_datagram_size: usize,
@@ -469,7 +469,7 @@ impl SocketPool {
     async fn run_udp_reader_single(
         socket: Arc<UdpSocket>,
         write_tx: mpsc::Sender<(Bytes, SocketAddr)>,
-        data_tx: mpsc::Sender<(super::transport::Transport, Bytes)>,
+        data_tx: mpsc::Sender<(super::transport::Transport, BytesMut)>,
         global_shutdown_rx: &mut broadcast::Receiver<()>,
         socket_shutdown_rx: &mut broadcast::Receiver<()>,
         max_udp_datagram_size: usize,
@@ -483,7 +483,7 @@ impl SocketPool {
                 result = socket.recv_from(&mut buf) => {
                     match result {
                         Ok((len, addr)) => {
-                            let data = Bytes::copy_from_slice(&buf[..len]);
+                            let data = BytesMut::from(&buf[..len]);
                             let route = super::transport::Transport::udp(write_tx.clone(), local_addr, addr);
                             if data_tx.send((route, data)).await.is_err() {
                                 return;
@@ -515,7 +515,7 @@ impl SocketPool {
     async fn run_udp_reader_mmsg(
         socket: Arc<UdpSocket>,
         write_tx: mpsc::Sender<(Bytes, SocketAddr)>,
-        data_tx: mpsc::Sender<(super::transport::Transport, Bytes)>,
+        data_tx: mpsc::Sender<(super::transport::Transport, BytesMut)>,
         global_shutdown_rx: &mut broadcast::Receiver<()>,
         socket_shutdown_rx: &mut broadcast::Receiver<()>,
         max_udp_datagram_size: usize,
@@ -557,7 +557,7 @@ impl SocketPool {
             };
 
             for index in 0..count {
-                let data = Bytes::copy_from_slice(&buffers[index]);
+                let data = BytesMut::from(&buffers[index][..]);
                 let route = super::transport::Transport::udp(
                     write_tx.clone(),
                     local_addr,

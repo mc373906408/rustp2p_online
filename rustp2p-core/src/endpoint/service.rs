@@ -1,7 +1,7 @@
 use crate::endpoint::config::Config;
 use crate::endpoint::pool::SocketPool;
 use crate::endpoint::transport::Transport;
-use bytes::Bytes;
+use bytes::BytesMut;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -10,8 +10,9 @@ use tokio::sync::mpsc;
 
 /// A received message with data and source transport.
 pub struct Received {
-    /// The received data (already framed for TCP).
-    pub data: Bytes,
+    /// The received data (already framed for TCP). Mutable: freeze it with
+    /// [`BytesMut::freeze`] if an immutable `Bytes` is preferred.
+    pub data: BytesMut,
     /// The source transport (can be used to send back).
     pub transport: Transport,
 }
@@ -38,7 +39,7 @@ pub struct Received {
 /// ```
 pub struct EndPoint {
     pool: Arc<SocketPool>,
-    data_rx: mpsc::Receiver<(Transport, Bytes)>,
+    data_rx: mpsc::Receiver<(Transport, BytesMut)>,
     config: Config,
     local_tcp_port: u16,
 }

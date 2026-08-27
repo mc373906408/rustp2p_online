@@ -46,7 +46,7 @@ to a received packet's source route.
 
 - one main UDP socket when UDP is enabled;
 - a TCP listener when TCP is enabled;
-- reader tasks that forward incoming data as `(Transport, Bytes)`;
+- reader tasks that forward incoming data as `(Transport, BytesMut)`;
 - a `Sender` and `Puncher` backed by the same socket pool.
 
 TCP uses an `InitCodec` to frame bytes. The default codec is length-prefixed.
@@ -56,10 +56,13 @@ UDP packets are delivered as received.
 
 ```rust
 Received {
-    data: Bytes,
+    data: BytesMut,
     transport: Transport,
 }
 ```
+
+The data is delivered mutable so the downstream can modify it in place; call
+`BytesMut::freeze()` if an immutable `Bytes` is preferred.
 
 The returned `Transport` can reply to the same remote address and exposes its
 `Protocol` and `SocketAddr`.
