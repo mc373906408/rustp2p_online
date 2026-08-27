@@ -146,26 +146,6 @@ pub async fn stun_test_nat(
     })
 }
 
-/// Tests NAT type using an existing socket.
-///
-/// Deprecated: running STUN over the caller's (main) UDP socket interferes
-/// with endpoint traffic — the `connect()` it performs makes the kernel
-/// filter out every other peer's packets during the test and leaves the
-/// socket in a connected state afterwards. Use [`stun_test_nat`] instead.
-/// This function now ignores the passed socket and delegates to
-/// [`stun_test_nat`], so the discovered port no longer corresponds to the
-/// passed socket's local port.
-#[deprecated(
-    note = "hijacks the passed socket; use stun_test_nat, which uses its own temporary socket"
-)]
-pub async fn stun_test_nat_with_socket(
-    socket: &UdpSocket,
-    stun_servers: Vec<String>,
-) -> io::Result<StunResult> {
-    let _ = socket;
-    stun_test_nat(stun_servers, None).await
-}
-
 pub(crate) async fn stun_test_nat0(
     stun_servers: Vec<String>,
     default_interface: Option<&LocalInterface>,
