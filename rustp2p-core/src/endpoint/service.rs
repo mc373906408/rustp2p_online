@@ -52,20 +52,16 @@ impl EndPoint {
             .take()
             .unwrap_or_else(|| Box::new(crate::endpoint::codec::LengthPrefixedInitCodec));
 
-        let mut pool_opt = None;
-        let mut data_rx_opt = None;
-
-        if let Some(port) = config.udp_port {
-            let (main_v4, main_v6) = bind_main_udp(port, config.enable_ipv6).await?;
-            let (pool, data_rx) = SocketPool::new(
-                main_v4,
-                main_v6,
-                codec.clone(),
-                config.max_udp_datagram_size,
-            );
-            pool_opt = Some(Arc::new(pool));
-            data_rx_opt = Some(data_rx);
-        }
+        let (data_tx, data_rx) = mpsc::channel(512);
+        let (main_v4, main_v6) =
+            bind_main_udp(config.udp_port.unwrap_or(0), config.enable_ipv6).await?;
+        let pool = Arc::new(SocketPool::new(
+            main_v4,
+            main_v6,
+            data_tx,
+            codec.clone(),
+            config.max_udp_datagram_size,
+        ));
 
         let tcp_listener = if let Some(port) = config.tcp_port {
             let addr = format!("0.0.0.0:{port}");
@@ -79,20 +75,6 @@ impl EndPoint {
             .and_then(|l| l.local_addr().ok())
             .map(|a| a.port())
             .unwrap_or(0);
-
-        let (pool, data_rx) = match pool_opt {
-            Some(p) => (p, data_rx_opt.unwrap()),
-            None => {
-                let (main_v4, main_v6) = bind_main_udp(0, config.enable_ipv6).await?;
-                let (pool, data_rx) = SocketPool::new(
-                    main_v4,
-                    main_v6,
-                    codec.clone(),
-                    config.max_udp_datagram_size,
-                );
-                (Arc::new(pool), data_rx)
-            }
-        };
 
         let ep = Self {
             pool,

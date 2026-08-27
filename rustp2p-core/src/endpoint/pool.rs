@@ -61,14 +61,15 @@ pub struct SocketPool {
 
 impl SocketPool {
     /// Create a pool from the main IPv4 UDP socket and an optional main IPv6
-    /// UDP socket.
+    /// UDP socket. Incoming data is forwarded through `data_tx`, whose
+    /// channel (and thus its capacity) is owned by the caller.
     pub fn new(
         main_udp_v4: UdpSocket,
         main_udp_v6: Option<UdpSocket>,
+        data_tx: mpsc::Sender<(super::transport::Transport, BytesMut)>,
         init_codec: Box<dyn InitCodec>,
         max_udp_datagram_size: usize,
-    ) -> (Self, mpsc::Receiver<(super::transport::Transport, BytesMut)>) {
-        let (data_tx, data_rx) = mpsc::channel(512);
+    ) -> Self {
         let (global_shutdown, _) = broadcast::channel(4);
 
         let main_udp_v4 = Arc::new(main_udp_v4);
@@ -84,7 +85,7 @@ impl SocketPool {
             s
         });
 
-        let pool = Self {
+        Self {
             main_udp_v4,
             main_udp_v6,
             assistant_udp: parking_lot::RwLock::new(Vec::new()),
@@ -94,8 +95,7 @@ impl SocketPool {
             init_codec,
             connect_lock: tokio::sync::Mutex::new(()),
             max_udp_datagram_size,
-        };
-        (pool, data_rx)
+        }
     }
 
     /// Spawn the read and write tasks for one UDP socket.
