@@ -1,12 +1,14 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, IoSlice};
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 #[cfg(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android")))]
 use std::{mem, os::fd::AsRawFd};
 #[cfg(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android")))]
 use tokio::io::Interest;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, mpsc};
 
@@ -197,7 +199,7 @@ impl SocketPool {
         let local_addr = read_half
             .local_addr()
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
-        let (mut decoder, mut encoder) = self.init_codec.codec(peer_addr)?;
+        let (mut decoder, encoder) = self.init_codec.codec(peer_addr)?;
         let (write_tx, mut write_rx) = mpsc::channel::<Bytes>(64);
         let data_tx = self.data_tx.clone();
         let mut shutdown_rx = self.global_shutdown.subscribe();
@@ -213,20 +215,29 @@ impl SocketPool {
         let pool_for_read = self.clone();
         tokio::spawn(async move {
             let mut read = read_half;
-            let mut data_buf = vec![0u8; 65536];
-            loop {
+            let mut buf = BytesMut::with_capacity(64 * 1024);
+            'read: loop {
                 tokio::select! {
-                    result = decoder.decode(&mut read, &mut data_buf) => {
+                    result = read.read_buf(&mut buf) => {
                         match result {
-                            Ok(len) => {
-                                let data = Bytes::copy_from_slice(&data_buf[..len]);
-                                let route = super::transport::Transport::tcp(conn_write_tx.clone(), local_addr, peer_addr);
-                                let _ = data_tx.send((route, data)).await;
+                            Ok(0) => break,
+                            Ok(_) => {
+                                loop {
+                                    match decoder.decode(&mut buf) {
+                                        Ok(Some(data)) => {
+                                            let route = super::transport::Transport::tcp(conn_write_tx.clone(), local_addr, peer_addr);
+                                            let _ = data_tx.send((route, data)).await;
+                                        }
+                                        Ok(None) => break,
+                                        Err(e) => {
+                                            log::warn!("TCP decode error: {e}");
+                                            break 'read;
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
-                                if e.kind() != io::ErrorKind::UnexpectedEof {
-                                    log::warn!("TCP decode error: {e}");
-                                }
+                                log::warn!("TCP read error: {e}");
                                 break;
                             }
                         }
@@ -244,12 +255,20 @@ impl SocketPool {
         let pool_for_write = self.clone();
         let mut shutdown_rx = self.global_shutdown.subscribe();
         tokio::spawn(async move {
+            let mut encoder = encoder;
             loop {
                 tokio::select! {
                     data = write_rx.recv() => {
                         match data {
                             Some(data) => {
-                                if let Err(e) = encoder.encode(&mut write_half, &data).await {
+                                // `iov` borrows `encoder` and `data`, so it is
+                                // scoped to a single frame.
+                                let mut iov = Vec::with_capacity(2);
+                                let result = match encoder.encode(&data, &mut iov) {
+                                    Ok(()) => write_all_vectored(&mut write_half, &mut iov).await,
+                                    Err(e) => Err(e),
+                                };
+                                if let Err(e) = result {
                                     log::warn!("TCP encode error: {e}");
                                     break;
                                 }
@@ -887,6 +906,28 @@ fn sockaddr_to_socket_addr(
             format!("unsupported sockaddr family or length: family={family}, len={len}"),
         )),
     }
+}
+
+/// Write all of `iov` with vectored writes, advancing across partial writes.
+async fn write_all_vectored(
+    write: &mut OwnedWriteHalf,
+    iov: &mut [IoSlice<'_>],
+) -> io::Result<()> {
+    let mut slices = iov;
+    while !slices.is_empty() {
+        match write.write_vectored(slices).await {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole frame",
+                ));
+            }
+            Ok(n) => IoSlice::advance_slices(&mut slices, n),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// A lightweight handle for sending data and querying socket state.

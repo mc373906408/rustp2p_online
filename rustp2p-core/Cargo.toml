@@ -12,7 +12,6 @@ log = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
-async-trait = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
 

@@ -1,10 +1,11 @@
-use std::io;
+use std::io::{self, IoSlice};
 use std::net::SocketAddr;
 
-use async_trait::async_trait;
+use bytes::{Buf, Bytes, BytesMut};
 use dyn_clone::DynClone;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+
+/// Maximum payload size of a single length-prefixed frame.
+const MAX_FRAME_LEN: usize = 64 * 1024;
 
 /// Factory for creating codec pairs.
 pub trait InitCodec: Send + Sync + DynClone {
@@ -13,32 +14,44 @@ pub trait InitCodec: Send + Sync + DynClone {
 dyn_clone::clone_trait_object!(InitCodec);
 
 /// Decoder for reading framed data.
-#[async_trait]
-pub trait Decoder: Send + Sync {
-    async fn decode(&mut self, read: &mut OwnedReadHalf, src: &mut [u8]) -> io::Result<usize>;
+///
+/// The read task appends bytes received from the stream to `buf` and calls
+/// `decode` in a loop until it returns `Ok(None)`:
+/// - `Ok(Some(frame))`: one complete frame was consumed from the front of
+///   `buf`. The returned [`Bytes`] is zero-copy, it shares `buf`'s allocation.
+/// - `Ok(None)`: more bytes are needed; unconsumed bytes stay in `buf`.
+/// - `Err(_)`: unrecoverable framing error, the connection is closed.
+pub trait Decoder: Send {
+    fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<Bytes>>;
 }
 
 /// Encoder for writing framed data.
-#[async_trait]
-pub trait Encoder: Send + Sync {
-    async fn encode(&mut self, write: &mut OwnedWriteHalf, data: &[u8]) -> io::Result<()>;
+///
+/// Implementations push the framed representation of `data` onto `iov` as
+/// scatter-gather slices, which the write task sends with a single vectored
+/// write. Slices may borrow from `data` directly or from `self` (e.g. an
+/// internal header buffer), so the payload is never copied.
+pub trait Encoder: Send {
+    fn encode<'a>(&'a mut self, data: &'a [u8], iov: &mut Vec<IoSlice<'a>>) -> io::Result<()>;
 }
 
 /// Raw bytes codec (no framing).
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct BytesCodec;
 
-#[async_trait]
 impl Decoder for BytesCodec {
-    async fn decode(&mut self, read: &mut OwnedReadHalf, src: &mut [u8]) -> io::Result<usize> {
-        read.read(src).await
+    fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<Bytes>> {
+        if buf.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(buf.split().freeze()))
     }
 }
 
-#[async_trait]
 impl Encoder for BytesCodec {
-    async fn encode(&mut self, write: &mut OwnedWriteHalf, data: &[u8]) -> io::Result<()> {
-        write.write_all(data).await
+    fn encode<'a>(&'a mut self, data: &'a [u8], iov: &mut Vec<IoSlice<'a>>) -> io::Result<()> {
+        iov.push(IoSlice::new(data));
+        Ok(())
     }
 }
 
@@ -53,32 +66,40 @@ impl InitCodec for BytesInitCodec {
 }
 
 /// Length-prefixed codec (4-byte big-endian length prefix).
-#[derive(Clone)]
-pub struct LengthPrefixedCodec;
+#[derive(Clone, Default)]
+pub struct LengthPrefixedCodec {
+    head: [u8; 4],
+}
 
-#[async_trait]
 impl Decoder for LengthPrefixedCodec {
-    async fn decode(&mut self, read: &mut OwnedReadHalf, src: &mut [u8]) -> io::Result<usize> {
-        let mut head = [0; 4];
-        read.read_exact(&mut head).await?;
-        let len = u32::from_be_bytes(head) as usize;
-        if len > src.len() {
+    fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<Bytes>> {
+        if buf.len() < 4 {
+            return Ok(None);
+        }
+        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        if len > MAX_FRAME_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("frame too large: {len}"),
             ));
         }
-        read.read_exact(&mut src[..len]).await?;
-        Ok(len)
+        if buf.len() < 4 + len {
+            // Pre-reserve so the rest of the frame is read with few syscalls.
+            buf.reserve(4 + len - buf.len());
+            return Ok(None);
+        }
+        buf.advance(4);
+        Ok(Some(buf.split_to(len).freeze()))
     }
 }
 
-#[async_trait]
 impl Encoder for LengthPrefixedCodec {
-    async fn encode(&mut self, write: &mut OwnedWriteHalf, data: &[u8]) -> io::Result<()> {
-        let len = data.len() as u32;
-        write.write_all(&len.to_be_bytes()).await?;
-        write.write_all(data).await?;
+    fn encode<'a>(&'a mut self, data: &'a [u8], iov: &mut Vec<IoSlice<'a>>) -> io::Result<()> {
+        let len = u32::try_from(data.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame too large"))?;
+        self.head = len.to_be_bytes();
+        iov.push(IoSlice::new(&self.head));
+        iov.push(IoSlice::new(data));
         Ok(())
     }
 }
@@ -89,6 +110,9 @@ pub struct LengthPrefixedInitCodec;
 
 impl InitCodec for LengthPrefixedInitCodec {
     fn codec(&self, _addr: SocketAddr) -> io::Result<(Box<dyn Decoder>, Box<dyn Encoder>)> {
-        Ok((Box::new(LengthPrefixedCodec), Box::new(LengthPrefixedCodec)))
+        Ok((
+            Box::new(LengthPrefixedCodec::default()),
+            Box::new(LengthPrefixedCodec::default()),
+        ))
     }
 }
