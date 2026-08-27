@@ -217,7 +217,7 @@ impl Puncher {
         count: usize,
         buf: &[u8],
         peer_nat_info: &NatInfo,
-        _punch_model: &PunchModel,
+        punch_model: &PunchModel,
     ) {
         log::debug!(
             "punch_udp count={} nat={:?} public_ips={:?} public_ports={:?} stun_ports={:?} port_range={}",
@@ -228,131 +228,143 @@ impl Puncher {
             peer_nat_info.stun_mapped_ports,
             peer_nat_info.public_port_range
         );
+        let allow_v4 = punch_model.is_match(PunchPolicy::IPv4Udp);
+        let allow_v6 = punch_model.is_match(PunchPolicy::IPv6Udp);
         // Send to manually configured mapping addresses
-        if !peer_nat_info.mapping_udp_addr.is_empty() {
-            let addrs: Vec<SocketAddr> = peer_nat_info
-                .mapping_udp_addr
-                .iter()
-                .filter(|a| a.is_ipv4())
-                .copied()
-                .collect();
-            for addr in &addrs {
+        for addr in &peer_nat_info.mapping_udp_addr {
+            let allowed = if addr.is_ipv4() { allow_v4 } else { allow_v6 };
+            if allowed {
                 let _ = self.pool.send_to(buf, *addr);
             }
         }
-        // Send to local addresses (same LAN)
-        if !peer_nat_info.local_ipv4_addrs().is_empty() {
-            let addrs = peer_nat_info.local_ipv4_addrs();
-            for addr in &addrs {
-                let _ = self.pool.send_to(buf, *addr);
-            }
-        }
-
-        match peer_nat_info.nat_type {
-            NatType::Symmetric => {
-                let max_k1: usize = 60;
-                // Keep Phase 2 batch size constant. The need_punch() backoff
-                // already reduces punch frequency over time, so shrinking the
-                // batch as well causes a compounding slowdown that makes later
-                // rounds nearly useless (e.g., 300 ports/round at count=30).
-                let max_k2: usize = rand::rng().random_range(1200..1500);
-
-                let pub_ips: Vec<std::net::Ipv4Addr> = peer_nat_info.public_ips.clone();
-                if pub_ips.is_empty() {
-                    log::warn!(
-                        "punch_udp: Symmetric NAT peer has no public IPs — \
-                         NatObserve may not have completed, cannot punch"
-                    );
-                    return;
-                }
-
-                // Phase 1: Predicted range punching.
-                //
-                // For each known port, generate a prediction window and send to
-                // random ports within that window.
-                //
-                // We combine two sources of known ports:
-                //   - `public_udp_ports`: observed by the relay (NatObserve).
-                //     This is the port the peer's main socket uses to talk to
-                //     the relay.
-                //   - `stun_mapped_ports`: discovered by STUN testing.  These
-                //     belong to a temp socket but reveal the NAT's port
-                //     allocation range.  For Symmetric NAT, the actual port
-                //     assigned for communication with us could be near either
-                //     set of ports.
-                //
-                // The port_range from STUN estimates how much the NAT varies
-                // port allocation between destinations. Keep one local window
-                // around every known port; the distance between unrelated
-                // relay and STUN mappings must not widen either window.
-                let predict_range = (peer_nat_info.public_port_range as usize * 10)
-                    .max(100)
-                    .min(max_k1 * 3 - 1) as u16;
-                let (all_known_ports, mut predicted_ports) =
-                    symmetric_prediction_candidates(peer_nat_info, predict_range);
-                predicted_ports.shuffle(&mut rand::rng());
-
-                let k = max_k1.min(predicted_ports.len());
-                if k > 0 {
-                    log::debug!(
-                        "punch_symmetric phase 1: sending to {} predicted ports \
-                         (known_ports={:?}, relay_ports={:?}, stun_ports={:?}, range=±{}, ips={:?})",
-                        k,
-                        all_known_ports,
-                        peer_nat_info.public_udp_ports,
-                        peer_nat_info.stun_mapped_ports,
-                        predict_range,
-                        pub_ips
-                    );
-                    self.punch_symmetric(&predicted_ports[..k], buf, &pub_ips, k)
-                        .await;
-                }
-
-                // Phase 2: Global random scan — send to random ports across
-                // the full 1-65535 range.  The cursor persists across punch
-                // attempts so we don't re-scan the same ports every time.
-                // Key the scan cursor by the peer's first public IP (the
-                // port part is irrelevant). public_ipv4_addr() cannot be
-                // used as the key: it is empty while no public UDP port is
-                // known and changes as ports are observed, which lost the
-                // cursor and restarted the global scan from the beginning
-                // every round. pub_ips is guaranteed non-empty here.
-                let cursor_key = SocketAddr::V4(SocketAddrV4::new(pub_ips[0], 0));
-                let start = self
-                    .port_cursor
-                    .lock()
-                    .get(&cursor_key)
-                    .copied()
-                    .unwrap_or(0);
-                let end = (start + max_k2).min(self.shuffled_ports.len());
-                log::debug!(
-                    "punch_symmetric phase 2: global scan {} ports (range [{}, {}))",
-                    end - start,
-                    start,
-                    end
-                );
-                let mut index = start
-                    + self
-                        .punch_symmetric(&self.shuffled_ports[start..end], buf, &pub_ips, max_k2)
-                        .await;
-                if index >= self.shuffled_ports.len() {
-                    index = 0;
-                }
-                self.port_cursor.lock().insert(cursor_key, index);
-            }
-            NatType::Cone => {
-                // Send to ALL known public addresses, not just the first
-                let addrs = peer_nat_info.public_ipv4_addr();
-                if addrs.is_empty() {
-                    log::warn!(
-                        "punch_udp: Cone NAT peer has no public addresses — \
-                         NatObserve may not have completed, cannot punch"
-                    );
-                }
+        if allow_v4 {
+            // Send to local addresses (same LAN)
+            if !peer_nat_info.local_ipv4_addrs().is_empty() {
+                let addrs = peer_nat_info.local_ipv4_addrs();
                 for addr in &addrs {
-                    log::debug!("punch_cone: sending to {addr}");
-                    self.pool.try_send_via_all(buf, *addr);
+                    let _ = self.pool.send_to(buf, *addr);
                 }
+            }
+
+            match peer_nat_info.nat_type {
+                NatType::Symmetric => {
+                    let max_k1: usize = 60;
+                    // Keep Phase 2 batch size constant. The need_punch() backoff
+                    // already reduces punch frequency over time, so shrinking the
+                    // batch as well causes a compounding slowdown that makes later
+                    // rounds nearly useless (e.g., 300 ports/round at count=30).
+                    let max_k2: usize = rand::rng().random_range(1200..1500);
+
+                    let pub_ips: Vec<std::net::Ipv4Addr> = peer_nat_info.public_ips.clone();
+                    if pub_ips.is_empty() {
+                        log::warn!(
+                            "punch_udp: Symmetric NAT peer has no public IPs — \
+                             NatObserve may not have completed, cannot punch"
+                        );
+                        return;
+                    }
+
+                    // Phase 1: Predicted range punching.
+                    //
+                    // For each known port, generate a prediction window and send to
+                    // random ports within that window.
+                    //
+                    // We combine two sources of known ports:
+                    //   - `public_udp_ports`: observed by the relay (NatObserve).
+                    //     This is the port the peer's main socket uses to talk to
+                    //     the relay.
+                    //   - `stun_mapped_ports`: discovered by STUN testing.  These
+                    //     belong to a temp socket but reveal the NAT's port
+                    //     allocation range.  For Symmetric NAT, the actual port
+                    //     assigned for communication with us could be near either
+                    //     set of ports.
+                    //
+                    // The port_range from STUN estimates how much the NAT varies
+                    // port allocation between destinations. Keep one local window
+                    // around every known port; the distance between unrelated
+                    // relay and STUN mappings must not widen either window.
+                    let predict_range = (peer_nat_info.public_port_range as usize * 10)
+                        .max(100)
+                        .min(max_k1 * 3 - 1) as u16;
+                    let (all_known_ports, mut predicted_ports) =
+                        symmetric_prediction_candidates(peer_nat_info, predict_range);
+                    predicted_ports.shuffle(&mut rand::rng());
+
+                    let k = max_k1.min(predicted_ports.len());
+                    if k > 0 {
+                        log::debug!(
+                            "punch_symmetric phase 1: sending to {} predicted ports \
+                             (known_ports={:?}, relay_ports={:?}, stun_ports={:?}, range=±{}, ips={:?})",
+                            k,
+                            all_known_ports,
+                            peer_nat_info.public_udp_ports,
+                            peer_nat_info.stun_mapped_ports,
+                            predict_range,
+                            pub_ips
+                        );
+                        self.punch_symmetric(&predicted_ports[..k], buf, &pub_ips, k)
+                            .await;
+                    }
+
+                    // Phase 2: Global random scan — send to random ports across
+                    // the full 1-65535 range.  The cursor persists across punch
+                    // attempts so we don't re-scan the same ports every time.
+                    // Key the scan cursor by the peer's first public IP (the
+                    // port part is irrelevant). public_ipv4_addr() cannot be
+                    // used as the key: it is empty while no public UDP port is
+                    // known and changes as ports are observed, which lost the
+                    // cursor and restarted the global scan from the beginning
+                    // every round. pub_ips is guaranteed non-empty here.
+                    let cursor_key = SocketAddr::V4(SocketAddrV4::new(pub_ips[0], 0));
+                    let start = self
+                        .port_cursor
+                        .lock()
+                        .get(&cursor_key)
+                        .copied()
+                        .unwrap_or(0);
+                    let end = (start + max_k2).min(self.shuffled_ports.len());
+                    log::debug!(
+                        "punch_symmetric phase 2: global scan {} ports (range [{}, {}))",
+                        end - start,
+                        start,
+                        end
+                    );
+                    let mut index = start
+                        + self
+                            .punch_symmetric(
+                                &self.shuffled_ports[start..end],
+                                buf,
+                                &pub_ips,
+                                max_k2,
+                            )
+                            .await;
+                    if index >= self.shuffled_ports.len() {
+                        index = 0;
+                    }
+                    self.port_cursor.lock().insert(cursor_key, index);
+                }
+                NatType::Cone => {
+                    // Send to ALL known public addresses, not just the first
+                    let addrs = peer_nat_info.public_ipv4_addr();
+                    if addrs.is_empty() {
+                        log::warn!(
+                            "punch_udp: Cone NAT peer has no public addresses — \
+                             NatObserve may not have completed, cannot punch"
+                        );
+                    }
+                    for addr in &addrs {
+                        log::debug!("punch_cone: sending to {addr}");
+                        self.pool.try_send_via_all(buf, *addr);
+                    }
+                }
+            }
+        }
+        // IPv6 needs no NAT traversal for global addresses; probe the
+        // peer's known v6 UDP addresses directly.
+        if allow_v6 {
+            for addr in peer_nat_info.ipv6_udp_addr() {
+                log::debug!("punch_udp ipv6: sending to {addr}");
+                self.pool.try_send_via_all(buf, addr);
             }
         }
     }
