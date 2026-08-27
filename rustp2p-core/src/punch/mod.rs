@@ -71,6 +71,8 @@ impl Puncher {
         }
     }
 
+    /// Returns whether a new punch round should be started for the peer,
+    /// based on the per-peer backoff schedule.
     pub fn need_punch(&self, punch_info: &PunchInfo) -> bool {
         let Some(id) = punch_info.peer_nat_info.flag() else {
             return false;
@@ -79,6 +81,10 @@ impl Puncher {
         should_punch(&stats, now())
     }
 
+    /// Punches only if [`Puncher::need_punch`] allows it.
+    ///
+    /// Note: like [`Puncher::punch_now`], the returned future is
+    /// long-running; spawn it instead of awaiting it inline.
     pub async fn punch(&self, buf: &[u8], punch_info: PunchInfo) -> io::Result<()> {
         if !self.need_punch(&punch_info) {
             return Ok(());
@@ -86,6 +92,14 @@ impl Puncher {
         self.punch_now(None, buf, punch_info).await
     }
 
+    /// Runs one full punch round, ignoring the backoff schedule.
+    ///
+    /// Note: the returned future is long-running. Symmetric-NAT punching
+    /// sends up to ~1500 UDP packets paced at 2 ms intervals, so a single
+    /// round can take several seconds. Callers must `tokio::spawn` this
+    /// (or otherwise run it on a dedicated task) rather than awaiting it
+    /// inline in a packet-dispatch or receive loop, which would stall all
+    /// other protocol processing for the duration of the round.
     pub async fn punch_now(
         &self,
         tcp_buf: Option<&[u8]>,
