@@ -326,10 +326,12 @@ impl SocketPool {
         }
         let sockets = self.assistant_udp.read();
         for entry in sockets.iter() {
-            entry
-                .socket
-                .try_send_to(buf, addr)
-                .map_err(|e| io::Error::other(format!("assistant send failed: {e}")))?;
+            // Best effort per socket, mirroring try_send_via_all: a transient
+            // failure on one assistant must not skip the remaining ones,
+            // punch probes need the full coverage.
+            if let Err(e) = entry.socket.try_send_to(buf, addr) {
+                log::debug!("assistant send to {addr} failed: {e}");
+            }
         }
         Ok(())
     }
