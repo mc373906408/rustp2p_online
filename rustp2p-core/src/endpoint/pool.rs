@@ -184,9 +184,20 @@ impl SocketPool {
         sockets.clear();
     }
 
-    /// Remove a TCP connection from the pool by peer address.
-    pub(crate) fn remove_tcp(&self, addr: SocketAddr) {
-        self.tcp_conns.write().remove(&addr);
+    /// Remove a TCP connection from the pool, but only if the map still
+    /// holds that exact connection instance. A task exiting after its
+    /// connection was replaced by a newer one to the same peer must not
+    /// remove the new entry.
+    pub(crate) fn remove_tcp(&self, addr: SocketAddr, conn: &Weak<TcpConnection>) {
+        let mut conns = self.tcp_conns.write();
+        if let Some(existing) = conns.get(&addr) {
+            let same_instance = conn
+                .upgrade()
+                .is_some_and(|conn| Arc::ptr_eq(existing, &conn));
+            if same_instance {
+                conns.remove(&addr);
+            }
+        }
     }
 
     /// Add a TCP connection with Decoder/Encoder.
@@ -210,9 +221,16 @@ impl SocketPool {
             write_tx,
         });
         let conn_write_tx = conn.write_tx.clone();
+        // Insert before spawning the tasks: they only remove this exact
+        // instance (checked by identity in remove_tcp), so a task can never
+        // remove a newer connection that replaced this one, and the entry is
+        // guaranteed to exist before any task may try to remove it.
+        self.tcp_conns.write().insert(peer_addr, conn.clone());
+        let weak = Arc::downgrade(&conn);
 
         // Read loop using Decoder
         let pool_for_read = self.clone();
+        let conn_weak = weak.clone();
         tokio::spawn(async move {
             let mut read = read_half;
             let mut buf = BytesMut::with_capacity(64 * 1024);
@@ -248,11 +266,12 @@ impl SocketPool {
                     }
                 }
             }
-            pool_for_read.remove_tcp(peer_addr);
+            pool_for_read.remove_tcp(peer_addr, &conn_weak);
         });
 
         // Write loop using Encoder
         let pool_for_write = self.clone();
+        let conn_weak = weak.clone();
         let mut shutdown_rx = self.global_shutdown.subscribe();
         tokio::spawn(async move {
             let mut encoder = encoder;
@@ -282,11 +301,9 @@ impl SocketPool {
                     }
                 }
             }
-            pool_for_write.remove_tcp(peer_addr);
+            pool_for_write.remove_tcp(peer_addr, &conn_weak);
         });
 
-        let weak = Arc::downgrade(&conn);
-        self.tcp_conns.write().insert(peer_addr, conn);
         Ok(weak)
     }
 
@@ -373,21 +390,6 @@ impl SocketPool {
     /// Get all TCP connections.
     pub fn tcp_connections(&self) -> Vec<Arc<TcpConnection>> {
         self.tcp_conns.read().values().cloned().collect()
-    }
-
-    /// Get a UDP socket by index: 0 = main IPv4, then main IPv6 (if present),
-    /// then assistants.
-    pub fn udp_socket(&self, index: usize) -> Option<Arc<UdpSocket>> {
-        let main_count = 1 + usize::from(self.main_udp_v6.is_some());
-        match index {
-            0 => Some(self.main_udp_v4.clone()),
-            1 if self.main_udp_v6.is_some() => self.main_udp_v6.clone(),
-            _ => self
-                .assistant_udp
-                .read()
-                .get(index - main_count)
-                .map(|e| e.socket.clone()),
-        }
     }
 
     /// Get all UDP sockets: main IPv4, main IPv6 (if present), then assistants.
@@ -990,11 +992,6 @@ impl Sender {
     /// Get all UDP sockets.
     pub fn udp_sockets(&self) -> Vec<Arc<UdpSocket>> {
         self.0.udp_sockets()
-    }
-
-    /// Get a UDP socket by index.
-    pub fn udp_socket(&self, index: usize) -> Option<Arc<UdpSocket>> {
-        self.0.udp_socket(index)
     }
 
     /// Find a TCP connection by peer address.
