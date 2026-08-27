@@ -16,8 +16,6 @@ use crate::endpoint::codec::InitCodec;
 
 #[cfg(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android")))]
 const UDP_BATCH_SIZE: usize = 16;
-#[cfg(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android")))]
-const UDP_RECV_BUFFER_SIZE: usize = 65_536;
 
 /// A managed assistant UDP socket entry with its own shutdown signal.
 struct UdpEntry {
@@ -57,6 +55,8 @@ pub struct SocketPool {
     global_shutdown: broadcast::Sender<()>,
     init_codec: Box<dyn InitCodec>,
     connect_lock: tokio::sync::Mutex<()>,
+    /// Maximum UDP datagram size; receive buffers are sized by this.
+    max_udp_datagram_size: usize,
 }
 
 impl SocketPool {
@@ -66,15 +66,21 @@ impl SocketPool {
         main_udp_v4: UdpSocket,
         main_udp_v6: Option<UdpSocket>,
         init_codec: Box<dyn InitCodec>,
+        max_udp_datagram_size: usize,
     ) -> (Self, mpsc::Receiver<(super::transport::Transport, Bytes)>) {
         let (data_tx, data_rx) = mpsc::channel(512);
         let (global_shutdown, _) = broadcast::channel(4);
 
         let main_udp_v4 = Arc::new(main_udp_v4);
-        Self::spawn_udp_tasks(main_udp_v4.clone(), &data_tx, &global_shutdown);
+        Self::spawn_udp_tasks(
+            main_udp_v4.clone(),
+            &data_tx,
+            &global_shutdown,
+            max_udp_datagram_size,
+        );
         let main_udp_v6 = main_udp_v6.map(|s| {
             let s = Arc::new(s);
-            Self::spawn_udp_tasks(s.clone(), &data_tx, &global_shutdown);
+            Self::spawn_udp_tasks(s.clone(), &data_tx, &global_shutdown, max_udp_datagram_size);
             s
         });
 
@@ -87,6 +93,7 @@ impl SocketPool {
             global_shutdown,
             init_codec,
             connect_lock: tokio::sync::Mutex::new(()),
+            max_udp_datagram_size,
         };
         (pool, data_rx)
     }
@@ -96,6 +103,7 @@ impl SocketPool {
         socket: Arc<UdpSocket>,
         data_tx: &mpsc::Sender<(super::transport::Transport, Bytes)>,
         global_shutdown: &broadcast::Sender<()>,
+        max_udp_datagram_size: usize,
     ) {
         let (write_tx, write_rx) = mpsc::channel::<(Bytes, SocketAddr)>(64);
 
@@ -110,6 +118,7 @@ impl SocketPool {
                 data_tx_clone,
                 &mut global_shutdown_rx,
                 &mut socket_shutdown_rx,
+                max_udp_datagram_size,
             )
             .await;
         });
@@ -140,6 +149,7 @@ impl SocketPool {
         let data_tx = self.data_tx.clone();
         let mut global_shutdown_rx = self.global_shutdown.subscribe();
         let s = socket.clone();
+        let max_udp_datagram_size = self.max_udp_datagram_size;
 
         tokio::spawn(async move {
             Self::run_udp_reader(
@@ -148,6 +158,7 @@ impl SocketPool {
                 data_tx,
                 &mut global_shutdown_rx,
                 &mut socket_shutdown_rx,
+                max_udp_datagram_size,
             )
             .await;
         });
@@ -416,6 +427,7 @@ impl SocketPool {
         data_tx: mpsc::Sender<(super::transport::Transport, Bytes)>,
         global_shutdown_rx: &mut broadcast::Receiver<()>,
         socket_shutdown_rx: &mut broadcast::Receiver<()>,
+        max_udp_datagram_size: usize,
     ) {
         #[cfg(all(feature = "sendmmsg", any(target_os = "linux", target_os = "android")))]
         {
@@ -425,6 +437,7 @@ impl SocketPool {
                 data_tx,
                 global_shutdown_rx,
                 socket_shutdown_rx,
+                max_udp_datagram_size,
             )
             .await;
         }
@@ -436,6 +449,7 @@ impl SocketPool {
                 data_tx,
                 global_shutdown_rx,
                 socket_shutdown_rx,
+                max_udp_datagram_size,
             )
             .await;
         }
@@ -448,8 +462,9 @@ impl SocketPool {
         data_tx: mpsc::Sender<(super::transport::Transport, Bytes)>,
         global_shutdown_rx: &mut broadcast::Receiver<()>,
         socket_shutdown_rx: &mut broadcast::Receiver<()>,
+        max_udp_datagram_size: usize,
     ) {
-        let mut buf = [0u8; 65536];
+        let mut buf = vec![0u8; max_udp_datagram_size];
         let local_addr = socket
             .local_addr()
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
@@ -493,9 +508,10 @@ impl SocketPool {
         data_tx: mpsc::Sender<(super::transport::Transport, Bytes)>,
         global_shutdown_rx: &mut broadcast::Receiver<()>,
         socket_shutdown_rx: &mut broadcast::Receiver<()>,
+        max_udp_datagram_size: usize,
     ) {
         let mut buffers = (0..UDP_BATCH_SIZE)
-            .map(|_| Vec::with_capacity(UDP_RECV_BUFFER_SIZE))
+            .map(|_| Vec::with_capacity(max_udp_datagram_size))
             .collect::<Vec<_>>();
         let mut peer_addrs = [SocketAddr::from(([0, 0, 0, 0], 0)); UDP_BATCH_SIZE];
         let local_addr = socket
@@ -911,10 +927,7 @@ fn sockaddr_to_socket_addr(
 }
 
 /// Write all of `iov` with vectored writes, advancing across partial writes.
-async fn write_all_vectored(
-    write: &mut OwnedWriteHalf,
-    iov: &mut [IoSlice<'_>],
-) -> io::Result<()> {
+async fn write_all_vectored(write: &mut OwnedWriteHalf, iov: &mut [IoSlice<'_>]) -> io::Result<()> {
     let mut slices = iov;
     while !slices.is_empty() {
         match write.write_vectored(slices).await {
@@ -1030,13 +1043,15 @@ mod mmsg_tests {
     use super::{
         is_recoverable_udp_recv_error, recv_mmsg, send_mmsg, sockaddr_to_socket_addr,
         socket_addr_to_sockaddr, Interest, SocketAddr, UdpSocket, UDP_BATCH_SIZE,
-        UDP_RECV_BUFFER_SIZE,
     };
     use bytes::Bytes;
     use std::io;
     use std::net::{Ipv6Addr, SocketAddrV6};
     use std::os::fd::AsRawFd;
     use std::time::Duration;
+
+    /// Test receive buffer size; the messages sent here are tiny.
+    const TEST_RECV_BUFFER_SIZE: usize = 2048;
 
     #[test]
     fn sockaddr_round_trip_preserves_ipv4_and_ipv6_fields() -> io::Result<()> {
@@ -1099,7 +1114,7 @@ mod mmsg_tests {
 
         let received = tokio::time::timeout(Duration::from_secs(1), async {
             let mut buffers = (0..UDP_BATCH_SIZE)
-                .map(|_| Vec::with_capacity(UDP_RECV_BUFFER_SIZE))
+                .map(|_| Vec::with_capacity(TEST_RECV_BUFFER_SIZE))
                 .collect::<Vec<_>>();
             let mut peer_addrs = [SocketAddr::from(([0, 0, 0, 0], 0)); UDP_BATCH_SIZE];
             let mut received = Vec::new();

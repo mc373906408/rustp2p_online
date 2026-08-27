@@ -56,7 +56,12 @@ impl EndPoint {
 
         if let Some(port) = config.udp_port {
             let (main_v4, main_v6) = bind_main_udp(port, config.enable_ipv6).await?;
-            let (pool, data_rx) = SocketPool::new(main_v4, main_v6, codec.clone());
+            let (pool, data_rx) = SocketPool::new(
+                main_v4,
+                main_v6,
+                codec.clone(),
+                config.max_udp_datagram_size,
+            );
             pool_opt = Some(Arc::new(pool));
             data_rx_opt = Some(data_rx);
         }
@@ -78,7 +83,12 @@ impl EndPoint {
             Some(p) => (p, data_rx_opt.unwrap()),
             None => {
                 let (main_v4, main_v6) = bind_main_udp(0, config.enable_ipv6).await?;
-                let (pool, data_rx) = SocketPool::new(main_v4, main_v6, codec.clone());
+                let (pool, data_rx) = SocketPool::new(
+                    main_v4,
+                    main_v6,
+                    codec.clone(),
+                    config.max_udp_datagram_size,
+                );
                 (Arc::new(pool), data_rx)
             }
         };
@@ -120,47 +130,6 @@ impl EndPoint {
         }
 
         Ok(ep)
-    }
-
-    /// Creates an endpoint from an existing UDP socket.
-    ///
-    /// The given socket becomes the main socket of its address family. When it
-    /// is IPv4, pass `main_udp_v6` to provide the main IPv6 socket explicitly;
-    /// `None` auto-binds one on the same port when the system supports IPv6.
-    pub async fn from_socket(
-        socket: UdpSocket,
-        main_udp_v6: Option<UdpSocket>,
-    ) -> io::Result<Self> {
-        let local = socket.local_addr()?;
-        let (main_v4, main_v6) = if local.is_ipv4() {
-            match main_udp_v6 {
-                Some(v6) => (socket, Some(v6)),
-                None => {
-                    let v6 = match bind_udp_v6(local.port()) {
-                        Ok(s) => Some(s),
-                        Err(e) => {
-                            log::warn!(
-                                "IPv6 main socket unavailable, falling back to IPv4 only: {e}"
-                            );
-                            None
-                        }
-                    };
-                    (socket, v6)
-                }
-            }
-        } else {
-            let v4 = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], local.port()))).await?;
-            (v4, Some(socket))
-        };
-        let codec: Box<dyn crate::endpoint::codec::InitCodec> =
-            Box::new(crate::endpoint::codec::LengthPrefixedInitCodec);
-        let (pool, data_rx) = SocketPool::new(main_v4, main_v6, codec);
-        Ok(Self {
-            pool: Arc::new(pool),
-            data_rx,
-            config: Config::default(),
-            local_tcp_port: 0,
-        })
     }
 
     /// Receives the next message from any peer.
