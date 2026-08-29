@@ -18,6 +18,7 @@ tokio = { workspace = true }
 
 socket2 = { version = "0.6", features = ["all"] }
 stun-format = { version = "1.0", features = ["fmt", "rfc3489"] }
+if-addrs = "0.15"
 serde = { version = "1.0", features = ["derive"] }
 libc = "0.2"
 dyn-clone = "1.0"

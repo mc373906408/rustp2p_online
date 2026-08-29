@@ -153,9 +153,23 @@ impl Puncher {
             stun_result.port_range
         );
 
-        let local_ipv4 = crate::util::addr::local_ipv4()
-            .await
-            .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+        // Enumerate the local IP addresses — only those of the bound NIC when
+        // one is configured. Probe-based resolution is the fallback for an
+        // address family that came up empty.
+        let interface = self.nat_config.default_interface.as_ref();
+        let scanned = crate::util::addr::local_ips(interface);
+        let mut local_ipv4s = scanned.ipv4s;
+        if local_ipv4s.is_empty() {
+            if let Some(ip) =
+                crate::util::addr::local_ipv4(interface, &self.nat_config.stun_servers).await
+            {
+                local_ipv4s.push(ip);
+            }
+        }
+        let mut ipv6 = scanned.ipv6s.into_iter().next();
+        if ipv6.is_none() {
+            ipv6 = crate::util::addr::local_ipv6(interface, &self.nat_config.stun_servers).await;
+        }
         let local_udp_ports = self
             .pool
             .udp_sockets()
@@ -173,9 +187,12 @@ impl Puncher {
             mapping_tcp_addr: self.nat_config.mapping_tcp_addr.clone(),
             mapping_udp_addr: self.nat_config.mapping_udp_addr.clone(),
             public_port_range: stun_result.port_range,
-            local_ipv4,
-            local_ipv4s: vec![],
-            ipv6: None,
+            local_ipv4: local_ipv4s
+                .first()
+                .copied()
+                .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+            local_ipv4s,
+            ipv6,
             local_udp_ports,
             local_tcp_port: self.nat_config.local_tcp_port,
             public_tcp_port: 0,
