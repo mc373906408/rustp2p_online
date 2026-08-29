@@ -203,7 +203,10 @@ impl Puncher {
                         target - current
                     );
                     for _ in current..target {
-                        let socket = crate::socket::bind_udp("0.0.0.0:0".parse().unwrap(), None)?;
+                        let socket = crate::socket::bind_udp(
+                            "0.0.0.0:0".parse().unwrap(),
+                            self.nat_config.default_interface.as_ref(),
+                        )?;
                         let std_socket: std::net::UdpSocket = socket.into();
                         let tokio_socket = tokio::net::UdpSocket::from_std(std_socket)?;
                         self.pool.add_assistant_udp(tokio_socket);
@@ -308,26 +311,30 @@ impl Puncher {
             for addr in &peer_nat_info.mapping_tcp_addr {
                 let buf = tcp_buf_owned.clone();
                 let a = *addr;
-                let pool = self.pool.clone();
+                let puncher = self.clone();
                 tcp_tasks.push(tokio::spawn(async move {
-                    Self::connect_tcp(&pool, buf.as_deref(), a, ttl, Duration::from_secs(3)).await;
+                    puncher
+                        .connect_tcp(buf.as_deref(), a, ttl, Duration::from_secs(3))
+                        .await;
                 }));
             }
         }
         if punch_model.is_match(PunchPolicy::IPv4Tcp) {
             if let Some(addr) = peer_nat_info.local_ipv4_tcp() {
                 let buf = tcp_buf_owned.clone();
-                let pool = self.pool.clone();
+                let puncher = self.clone();
                 tcp_tasks.push(tokio::spawn(async move {
-                    Self::connect_tcp(&pool, buf.as_deref(), addr, ttl, Duration::from_millis(100))
+                    puncher
+                        .connect_tcp(buf.as_deref(), addr, ttl, Duration::from_millis(100))
                         .await;
                 }));
             }
             for addr in peer_nat_info.public_ipv4_tcp() {
                 let buf = tcp_buf_owned.clone();
-                let pool = self.pool.clone();
+                let puncher = self.clone();
                 tcp_tasks.push(tokio::spawn(async move {
-                    Self::connect_tcp(&pool, buf.as_deref(), addr, ttl, Duration::from_secs(3))
+                    puncher
+                        .connect_tcp(buf.as_deref(), addr, ttl, Duration::from_secs(3))
                         .await;
                 }));
             }
@@ -335,9 +342,10 @@ impl Puncher {
         if punch_model.is_match(PunchPolicy::IPv6Tcp) {
             if let Some(addr) = peer_nat_info.ipv6_tcp_addr() {
                 let buf = tcp_buf_owned.clone();
-                let pool = self.pool.clone();
+                let puncher = self.clone();
                 tcp_tasks.push(tokio::spawn(async move {
-                    Self::connect_tcp(&pool, buf.as_deref(), addr, ttl, Duration::from_secs(3))
+                    puncher
+                        .connect_tcp(buf.as_deref(), addr, ttl, Duration::from_secs(3))
                         .await;
                 }));
             }
@@ -349,16 +357,22 @@ impl Puncher {
     }
 
     async fn connect_tcp(
-        pool: &Arc<SocketPool>,
+        &self,
         buf: Option<&[u8]>,
         addr: SocketAddr,
         ttl: Option<u8>,
         timeout: Duration,
     ) {
         match tokio::time::timeout(timeout, async {
-            let stream = crate::socket::connect_tcp(addr, 0, None, ttl).await?;
+            let stream = crate::socket::connect_tcp(
+                addr,
+                0,
+                self.nat_config.default_interface.as_ref(),
+                ttl,
+            )
+            .await?;
             let initial_data = buf.map(Bytes::copy_from_slice);
-            pool.publish_tcp(stream, addr, initial_data).await
+            self.pool.publish_tcp(stream, addr, initial_data).await
         })
         .await
         {

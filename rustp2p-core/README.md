@@ -16,6 +16,8 @@ application datagrams, reliable streams, discovery, and relay forwarding, use
 - UDP five-tuple and TCP connection tunnels yielded from one `TunnelIncoming`.
 - `Tunnel::split` for moving the receive and cloneable send halves into separate tasks.
 - Cloneable `Puncher` for raw UDP sends, socket queries, NAT discovery, and punching.
+- Consistent `Config::default_interface` selection for main/assistant UDP,
+  TCP listener/punch connections, IPv4/IPv6, and STUN sockets.
 - TCP framing through configurable codecs.
 - Route table utilities with multiple routes per peer id and load balancing.
 - STUN-based NAT type and port-range detection when explicitly configured.

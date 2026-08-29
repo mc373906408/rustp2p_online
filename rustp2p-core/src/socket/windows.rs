@@ -3,21 +3,29 @@ use std::os::windows::io::AsRawSocket;
 
 use windows_sys::core::PCSTR;
 use windows_sys::Win32::Networking::WinSock::{
-    htonl, setsockopt, WSAIoctl, IPPROTO_IP, IP_UNICAST_IF, SIO_UDP_CONNRESET, SOCKET_ERROR,
+    htonl, setsockopt, WSAIoctl, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, IP_UNICAST_IF,
+    SIO_UDP_CONNRESET, SOCKET_ERROR,
 };
 
 use crate::socket::{LocalInterface, SocketTrait};
 
 impl SocketTrait for socket2::Socket {
-    fn set_ip_unicast_if(&self, interface: &LocalInterface) -> io::Result<()> {
+    fn set_ip_unicast_if(&self, interface: &LocalInterface, is_ipv6: bool) -> io::Result<()> {
         let index = interface.index;
         let raw_socket = self.as_raw_socket();
         let result = unsafe {
-            let best_interface = htonl(index);
+            // Windows expects the IPv4 interface index in network byte order,
+            // while IPV6_UNICAST_IF takes it in host byte order.
+            let best_interface = if is_ipv6 { index } else { htonl(index) };
+            let (level, option) = if is_ipv6 {
+                (IPPROTO_IPV6, IPV6_UNICAST_IF)
+            } else {
+                (IPPROTO_IP, IP_UNICAST_IF)
+            };
             setsockopt(
                 raw_socket as usize,
-                IPPROTO_IP,
-                IP_UNICAST_IF,
+                level,
+                option,
                 &best_interface as *const _ as PCSTR,
                 std::mem::size_of_val(&best_interface) as i32,
             )

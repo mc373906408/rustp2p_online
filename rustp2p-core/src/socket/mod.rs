@@ -26,9 +26,8 @@ use std::net::SocketAddr;
 mod unix;
 #[cfg(windows)]
 mod windows;
-
 pub(crate) trait SocketTrait {
-    fn set_ip_unicast_if(&self, _interface: &LocalInterface) -> io::Result<()> {
+    fn set_ip_unicast_if(&self, _interface: &LocalInterface, _is_ipv6: bool) -> io::Result<()> {
         Ok(())
     }
 }
@@ -36,7 +35,9 @@ pub(crate) trait SocketTrait {
 /// Network interface identifier for binding sockets.
 ///
 /// On Linux/Android, this uses the interface name (e.g., "eth0").
-/// On other platforms, this uses the interface index.
+/// On Windows, macOS, and iOS, this uses the interface index. Platforms
+/// without a supported socket option return [`io::ErrorKind::Unsupported`]
+/// when the interface is applied.
 ///
 /// # Examples
 ///
@@ -47,8 +48,8 @@ pub(crate) trait SocketTrait {
 /// #[cfg(any(target_os = "linux", target_os = "android"))]
 /// let iface = LocalInterface::new("eth0".to_string());
 ///
-/// // On other platforms
-/// #[cfg(not(any(target_os = "linux", target_os = "android")))]
+/// // On Windows, macOS, and iOS
+/// #[cfg(any(windows, target_os = "macos", target_os = "ios"))]
 /// let iface = LocalInterface::new(2); // interface index
 /// ```
 #[derive(Clone, Debug)]
@@ -82,7 +83,7 @@ pub(crate) fn bind_udp_ops(
             Some(Protocol::UDP),
         )?;
         if let Some(default_interface) = default_interface {
-            socket.set_ip_unicast_if(default_interface)?;
+            socket.set_ip_unicast_if(default_interface, false)?;
         }
         socket
     } else {
@@ -92,6 +93,9 @@ pub(crate) fn bind_udp_ops(
             Some(Protocol::UDP),
         )?;
         socket.set_only_v6(only_v6)?;
+        if let Some(default_interface) = default_interface {
+            socket.set_ip_unicast_if(default_interface, true)?;
+        }
         socket
     };
     #[cfg(windows)]
@@ -108,6 +112,52 @@ pub fn bind_udp(
     default_interface: Option<&LocalInterface>,
 ) -> io::Result<socket2::Socket> {
     bind_udp_ops(addr, true, default_interface)
+}
+
+/// Binds a non-blocking TCP listener, applying the configured interface before
+/// the socket is bound.
+pub(crate) fn bind_tcp_listener(
+    addr: SocketAddr,
+    default_interface: Option<&LocalInterface>,
+) -> io::Result<tokio::net::TcpListener> {
+    // Preserve the platform defaults used by std/Tokio when no interface is
+    // requested. In particular, Windows has stricter port-allocation behavior
+    // for manually created listener sockets around recently used ephemeral
+    // ports.
+    if default_interface.is_none() {
+        let listener = std::net::TcpListener::bind(addr)?;
+        listener.set_nonblocking(true)?;
+        return tokio::net::TcpListener::from_std(listener);
+    }
+
+    let is_ipv6 = addr.is_ipv6();
+    let domain = if is_ipv6 {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(Protocol::TCP))?;
+    if is_ipv6 {
+        socket.set_only_v6(true)?;
+    }
+    if let Some(default_interface) = default_interface {
+        socket.set_ip_unicast_if(default_interface, is_ipv6)?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    tokio::net::TcpListener::from_std(socket.into())
+}
+
+/// Applies the selected interface to an accepted TCP stream. Listener socket
+/// option inheritance varies by platform, so accepted connections are
+/// configured explicitly as well.
+pub(crate) fn set_tcp_stream_interface(
+    stream: &tokio::net::TcpStream,
+    interface: &LocalInterface,
+) -> io::Result<()> {
+    let socket = socket2::SockRef::from(stream);
+    socket.set_ip_unicast_if(interface, stream.peer_addr()?.is_ipv6())
 }
 
 /// Upper bound for a single non-blocking TCP connect attempt. Without this,
@@ -154,8 +204,8 @@ pub(crate) fn create_tcp0(
             Some(Protocol::TCP),
         )?
     };
-    if let (true, Some(interface)) = (v4, default_interface) {
-        socket.set_ip_unicast_if(interface)?;
+    if let Some(interface) = default_interface {
+        socket.set_ip_unicast_if(interface, !v4)?;
     }
     if bind_port != 0 {
         _ = socket.set_reuse_address(true);
@@ -186,4 +236,21 @@ pub(crate) fn create_tcp0(
         Err(e) => Err(e)?,
     }
     tokio::net::TcpStream::from_std(socket.into())
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod tests {
+    use super::{bind_tcp_listener, bind_udp, create_tcp0, LocalInterface};
+
+    fn missing_interface() -> LocalInterface {
+        LocalInterface::new("rp2pnone".to_owned())
+    }
+
+    #[test]
+    fn socket_creation_applies_default_interface() {
+        let interface = missing_interface();
+        assert!(bind_udp("0.0.0.0:0".parse().unwrap(), Some(&interface)).is_err());
+        assert!(bind_tcp_listener("0.0.0.0:0".parse().unwrap(), Some(&interface)).is_err());
+        assert!(create_tcp0("127.0.0.1:9".parse().unwrap(), 0, Some(&interface), None).is_err());
+    }
 }

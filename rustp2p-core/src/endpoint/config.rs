@@ -124,6 +124,12 @@ impl Config {
         self
     }
 
+    /// Selects the network interface used by main and assistant UDP sockets,
+    /// the TCP listener, TCP hole-punch connections, and STUN queries.
+    ///
+    /// On Linux and Android, binding with `SO_BINDTODEVICE` also restricts
+    /// inbound traffic. On platforms whose socket option only selects an
+    /// outgoing interface, inbound wildcard listeners remain wildcard-bound.
     pub fn default_interface(mut self, interface: LocalInterface) -> Self {
         self.default_interface = Some(interface);
         self

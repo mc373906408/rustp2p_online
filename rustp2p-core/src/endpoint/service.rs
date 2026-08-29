@@ -1,6 +1,7 @@
 use crate::endpoint::config::Config;
 use crate::endpoint::pool::SocketPool;
 use crate::endpoint::tunnel::Tunnel;
+use crate::socket::LocalInterface;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -48,8 +49,12 @@ impl TunnelIncoming {
             .unwrap_or_else(|| Box::new(crate::endpoint::codec::LengthPrefixedInitCodec));
 
         let (accept_tx, tunnel_rx) = mpsc::channel(512);
-        let (main_v4, main_v6) =
-            bind_main_udp(config.udp_port.unwrap_or(0), config.enable_ipv6).await?;
+        let (main_v4, main_v6) = bind_main_udp(
+            config.udp_port.unwrap_or(0),
+            config.enable_ipv6,
+            config.default_interface.as_ref(),
+        )
+        .await?;
         let pool = Arc::new(SocketPool::new(
             main_v4,
             main_v6,
@@ -60,7 +65,7 @@ impl TunnelIncoming {
 
         let tcp_listener = if let Some(port) = config.tcp_port {
             let udp_port = pool.local_addr()?.port();
-            Some(bind_tcp(port, udp_port).await?)
+            Some(bind_tcp(port, udp_port, config.default_interface.as_ref())?)
         } else {
             None
         };
@@ -81,6 +86,7 @@ impl TunnelIncoming {
         // Start TCP accept loop
         if let Some(tcp_listener) = tcp_listener {
             let pool = incoming.pool.clone();
+            let default_interface = incoming.config.default_interface.clone();
             let mut shutdown_rx = pool.shutdown_rx();
             tokio::spawn(async move {
                 loop {
@@ -89,6 +95,12 @@ impl TunnelIncoming {
                             match result {
                                 Ok((stream, peer_addr)) => {
                                     log::debug!("TCP connection from {peer_addr}");
+                                    if let Some(interface) = default_interface.as_ref() {
+                                        if let Err(e) = crate::socket::set_tcp_stream_interface(&stream, interface) {
+                                            log::warn!("TCP interface setup error for {peer_addr}: {e}");
+                                            continue;
+                                        }
+                                    }
                                     if let Err(e) = pool.publish_tcp(stream, peer_addr, None).await {
                                         log::warn!("TCP setup error: {e}");
                                     }
@@ -170,35 +182,39 @@ impl std::fmt::Debug for TunnelIncoming {
 ///
 /// A missing second socket (IPv6 unsupported or disabled) is a silent
 /// downgrade to IPv4 only, not an error.
-async fn bind_main_udp(port: u16, enable_ipv6: bool) -> io::Result<(UdpSocket, Option<UdpSocket>)> {
+async fn bind_main_udp(
+    port: u16,
+    enable_ipv6: bool,
+    default_interface: Option<&LocalInterface>,
+) -> io::Result<(UdpSocket, Option<UdpSocket>)> {
     if !enable_ipv6 {
-        let main_v4 = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
+        let main_v4 = bind_udp_v4(port, default_interface).await?;
         return Ok((main_v4, None));
     }
     if port != 0 {
-        let main_v4 = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
-        return bind_v6_same_port(main_v4, port).await;
+        let main_v4 = bind_udp_v4(port, default_interface).await?;
+        return bind_v6_same_port(main_v4, port, default_interface).await;
     }
     // Bind an IPv6-only socket on port 0 first. On systems without IPv6 the
     // bind fails, so this doubles as a capability probe - no retry needed.
-    match bind_udp_v6(0) {
+    match bind_udp_v6(0, default_interface) {
         Ok(mut main_v6) => {
             // IPv6 is supported. Pair the v4 socket on the same port; when
             // the v4 bind conflicts, re-bind v6 for a fresh port and retry,
             // up to 20 attempts.
             for _ in 0..20 {
                 let port = main_v6.local_addr()?.port();
-                if let Ok(main_v4) = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))).await {
+                if let Ok(main_v4) = bind_udp_v4(port, default_interface).await {
                     return Ok((main_v4, Some(main_v6)));
                 }
-                main_v6 = bind_udp_v6(0)?;
+                main_v6 = bind_udp_v6(0, default_interface)?;
             }
-            let main_v4 = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?;
+            let main_v4 = bind_udp_v4(0, default_interface).await?;
             Ok((main_v4, Some(main_v6)))
         }
         Err(e) => {
             log::warn!("IPv6 main socket unavailable, using IPv4 only: {e}");
-            let main_v4 = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?;
+            let main_v4 = bind_udp_v4(0, default_interface).await?;
             Ok((main_v4, None))
         }
     }
@@ -209,8 +225,9 @@ async fn bind_main_udp(port: u16, enable_ipv6: bool) -> io::Result<(UdpSocket, O
 async fn bind_v6_same_port(
     main_v4: UdpSocket,
     port: u16,
+    default_interface: Option<&LocalInterface>,
 ) -> io::Result<(UdpSocket, Option<UdpSocket>)> {
-    match bind_udp_v6(port) {
+    match bind_udp_v6(port, default_interface) {
         Ok(main_v6) => Ok((main_v4, Some(main_v6))),
         Err(e) => {
             log::warn!("IPv6 main socket unavailable, falling back to IPv4 only: {e}");
@@ -222,8 +239,28 @@ async fn bind_v6_same_port(
 /// Bind an IPv6-only UDP socket on `[::]:port`.
 ///
 /// v6-only so a v4 socket bound to the same port does not conflict.
-fn bind_udp_v6(port: u16) -> io::Result<UdpSocket> {
-    let socket = crate::socket::bind_udp_ops(format!("[::]:{port}").parse().unwrap(), true, None)?;
+async fn bind_udp_v4(
+    port: u16,
+    default_interface: Option<&LocalInterface>,
+) -> io::Result<UdpSocket> {
+    if default_interface.is_none() {
+        return UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))).await;
+    }
+    let socket = crate::socket::bind_udp_ops(
+        SocketAddr::from(([0, 0, 0, 0], port)),
+        true,
+        default_interface,
+    )?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(std_socket)
+}
+
+fn bind_udp_v6(port: u16, default_interface: Option<&LocalInterface>) -> io::Result<UdpSocket> {
+    let socket = crate::socket::bind_udp_ops(
+        format!("[::]:{port}").parse().unwrap(),
+        true,
+        default_interface,
+    )?;
     let std_socket: std::net::UdpSocket = socket.into();
     UdpSocket::from_std(std_socket)
 }
@@ -238,7 +275,11 @@ impl Drop for TunnelIncoming {
 /// port, keeping the externally visible protocol ports aligned when possible.
 /// Only an address conflict triggers a fallback to an OS-assigned port; other
 /// errors are returned to the caller.
-async fn bind_tcp(configured_port: u16, udp_port: u16) -> io::Result<TcpListener> {
+fn bind_tcp(
+    configured_port: u16,
+    udp_port: u16,
+    default_interface: Option<&LocalInterface>,
+) -> io::Result<TcpListener> {
     let preferred_port = if configured_port == 0 {
         udp_port
     } else {
@@ -246,13 +287,13 @@ async fn bind_tcp(configured_port: u16, udp_port: u16) -> io::Result<TcpListener
     };
     let preferred_addr = SocketAddr::from(([0, 0, 0, 0], preferred_port));
 
-    match TcpListener::bind(preferred_addr).await {
+    match crate::socket::bind_tcp_listener(preferred_addr, default_interface) {
         Ok(listener) => Ok(listener),
         Err(error) if configured_port == 0 && is_tcp_port_conflict(&error) => {
             log::debug!(
                 "TCP port {preferred_port} is occupied, falling back to an OS-assigned port"
             );
-            TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await
+            crate::socket::bind_tcp_listener(SocketAddr::from(([0, 0, 0, 0], 0)), default_interface)
         }
         Err(error) => Err(error),
     }
@@ -373,6 +414,19 @@ mod tests {
         assert_eq!(nat_info.mapping_udp_addr, vec![mapping_udp_addr]);
         assert_eq!(nat_info.local_tcp_port, listener.local_tcp_port());
         assert_eq!(nat_info.local_udp_ports, listener.local_udp_ports());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn bind_applies_default_interface_to_the_main_socket() {
+        let result = TunnelIncoming::bind(
+            Config::udp(0)
+                .enable_ipv6(false)
+                .default_interface(crate::socket::LocalInterface::new("rp2pnone".to_owned())),
+        )
+        .await;
+
+        assert!(result.is_err());
     }
 
     #[tokio::test]
