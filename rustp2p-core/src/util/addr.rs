@@ -1,5 +1,5 @@
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use tokio::net::UdpSocket;
 
 use crate::socket::LocalInterface;
@@ -96,11 +96,12 @@ pub async fn local_ipv4(
     interface: Option<&LocalInterface>,
     stun_servers: &[String],
 ) -> Option<Ipv4Addr> {
-    let probes = stun_servers
+    let probes: Vec<&str> = stun_servers
         .iter()
         .map(String::as_str)
-        .chain(LOCAL_IPV4_PROBES.iter().copied());
-    match resolve_source_ip(interface, "0.0.0.0:0", probes).await {
+        .chain(LOCAL_IPV4_PROBES.iter().copied())
+        .collect();
+    match resolve_source_ip(interface, "0.0.0.0:0", &probes).await {
         Ok(IpAddr::V4(ip)) => Some(ip),
         Ok(IpAddr::V6(_)) => None,
         Err(e) => {
@@ -117,11 +118,12 @@ pub async fn local_ipv6(
     interface: Option<&LocalInterface>,
     stun_servers: &[String],
 ) -> Option<Ipv6Addr> {
-    let probes = stun_servers
+    let probes: Vec<&str> = stun_servers
         .iter()
         .map(String::as_str)
-        .chain(LOCAL_IPV6_PROBES.iter().copied());
-    match resolve_source_ip(interface, "[::]:0", probes).await {
+        .chain(LOCAL_IPV6_PROBES.iter().copied())
+        .collect();
+    match resolve_source_ip(interface, "[::]:0", &probes).await {
         Ok(IpAddr::V6(ip)) if is_ipv6_global(&ip) => Some(ip),
         Ok(ip) => {
             log::debug!("local ipv6 {ip} is not a global address, dropping");
@@ -139,14 +141,23 @@ pub async fn local_ipv6(
 async fn resolve_source_ip(
     interface: Option<&LocalInterface>,
     bind_addr: &str,
-    probes: impl IntoIterator<Item = &str>,
+    probes: &[&str],
 ) -> io::Result<IpAddr> {
     for dest in probes {
+        // Resolve to a concrete `SocketAddr` before connecting. Passing the
+        // late-bound `&str` directly to `UdpSocket::connect`, which takes
+        // `impl ToSocketAddrs`, prevents rustc from normalizing this async
+        // fn's opaque future type at generic boundaries (E0308 "one type is
+        // more general than the other").
+        let addr = match (*dest).to_socket_addrs()?.next() {
+            Some(addr) => addr,
+            None => continue,
+        };
         // A fresh socket per attempt: a failed connect must not leave a
         // half-configured socket behind for the next destination.
         let socket = crate::socket::bind_udp(bind_addr.parse().unwrap(), interface)?;
         let socket = UdpSocket::from_std(socket.into())?;
-        if socket.connect(dest).await.is_err() {
+        if socket.connect(addr).await.is_err() {
             continue;
         }
         if let Ok(addr) = socket.local_addr() {

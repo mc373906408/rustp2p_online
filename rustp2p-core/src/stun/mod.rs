@@ -27,7 +27,7 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::nat::NatType;
@@ -202,7 +202,21 @@ pub(crate) async fn stun_test_nat0(
 }
 
 async fn test_nat(udp: &UdpSocket, stun_server: &str) -> io::Result<HashSet<SocketAddr>> {
-    udp.connect(stun_server).await?;
+    // Resolve to a concrete `SocketAddr` before connecting. Passing the
+    // late-bound `&str` directly to `UdpSocket::connect`, which takes
+    // `impl ToSocketAddrs`, prevents rustc from normalizing this async fn's
+    // opaque future type at generic boundaries (E0308 "one type is more
+    // general than the other").
+    let server_addr = match stun_server.to_socket_addrs()?.next() {
+        Some(addr) => addr,
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("STUN server resolves to no address: {stun_server}"),
+            ))
+        }
+    };
+    udp.connect(server_addr).await?;
     let tid = rand::rng().next_u64() as u128;
     let mut addr = HashSet::new();
     let (mapped_addr1, changed_addr1) = test_nat_(udp, stun_server, true, true, tid).await?;
