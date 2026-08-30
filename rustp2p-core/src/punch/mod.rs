@@ -138,8 +138,23 @@ impl Puncher {
     /// Gets NAT information using the STUN and mapping configuration captured
     /// when this puncher was created.
     pub async fn nat_info(&self) -> io::Result<NatInfo> {
+        self.nat_info_with_servers(&self.nat_config.stun_servers)
+            .await
+    }
+
+    /// Gets NAT information using custom STUN servers.
+    ///
+    /// `stun_servers` override the servers captured when this puncher was
+    /// created; the mapping-address and interface configurations are still
+    /// taken from it. An empty slice falls back to the configured servers.
+    pub async fn nat_info_with_servers(&self, stun_servers: &[String]) -> io::Result<NatInfo> {
+        let stun_servers = if stun_servers.is_empty() {
+            &self.nat_config.stun_servers
+        } else {
+            stun_servers
+        };
         let stun_result = crate::stun::stun_test_nat(
-            self.nat_config.stun_servers.clone(),
+            stun_servers.to_vec(),
             self.nat_config.default_interface.as_ref(),
         )
         .await?;
@@ -160,15 +175,13 @@ impl Puncher {
         let scanned = crate::util::addr::local_ips(interface);
         let mut local_ipv4s = scanned.ipv4s;
         if local_ipv4s.is_empty() {
-            if let Some(ip) =
-                crate::util::addr::local_ipv4(interface, &self.nat_config.stun_servers).await
-            {
+            if let Some(ip) = crate::util::addr::local_ipv4(interface, stun_servers).await {
                 local_ipv4s.push(ip);
             }
         }
         let mut ipv6 = scanned.ipv6s.into_iter().next();
         if ipv6.is_none() {
-            ipv6 = crate::util::addr::local_ipv6(interface, &self.nat_config.stun_servers).await;
+            ipv6 = crate::util::addr::local_ipv6(interface, stun_servers).await;
         }
         let local_udp_ports = self
             .pool
