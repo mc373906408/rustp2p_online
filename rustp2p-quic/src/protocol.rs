@@ -1303,9 +1303,9 @@ impl ProtocolLayer {
             addrs.push(SocketAddr::new(ip, local.port()));
         }
 
-        // TCP addr: when the local bind IP is unspecified, local_tcp_addr()
-        // constructs 0.0.0.0:tcp_port from self.local_addr.ip(). Use the same
-        // advertised_ip fallback so peers learn a routable TCP address too.
+        // TCP addr: when bound to a wildcard, local_tcp_addr() reports an
+        // unspecified address. Use the advertised_ip fallback so peers learn
+        // a routable TCP address too.
         if let Some(addr) = self.transport.local_tcp_addr() {
             let tcp_addr = if addr.ip().is_unspecified() {
                 advertised_ip.map(|ip| SocketAddr::new(ip, addr.port()))

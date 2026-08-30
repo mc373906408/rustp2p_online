@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 
-/// Binds the shared UDP sockets and TCP listeners and yields logical tunnels.
+/// Binds the shared UDP sockets and TCP listener and yields logical tunnels.
 ///
 /// # Examples
 ///
@@ -37,8 +37,7 @@ pub struct TunnelIncoming {
     pool: Arc<SocketPool>,
     tunnel_rx: mpsc::Receiver<Tunnel>,
     config: Config,
-    local_tcp_port: u16,
-    local_tcp_port_v6: Option<u16>,
+    local_tcp_addr: Option<SocketAddr>,
 }
 
 impl TunnelIncoming {
@@ -57,10 +56,6 @@ impl TunnelIncoming {
         )
         .await?;
         let udp_v4_port = main_v4.local_addr()?.port();
-        let udp_v6_port = main_v6
-            .as_ref()
-            .map(|socket| socket.local_addr().map(|addr| addr.port()))
-            .transpose()?;
         let pool = Arc::new(SocketPool::new(
             main_v4,
             main_v6,
@@ -69,60 +64,28 @@ impl TunnelIncoming {
             config.max_udp_datagram_size,
         ));
 
-        let (tcp_listener, tcp_listener_v6) = if let Some(port) = config.tcp_port {
-            let tcp_v4 = bind_tcp(port, udp_v4_port, config.default_interface.as_ref(), false)?;
-            let tcp_v6 = if config.enable_ipv6 {
-                match bind_tcp(
-                    port,
-                    udp_v6_port.unwrap_or(udp_v4_port),
-                    config.default_interface.as_ref(),
-                    true,
-                ) {
-                    Ok(listener) => Some(listener),
-                    // IPv6 missing on this host (or the v6 bind failing for any
-                    // other reason) is a silent downgrade to IPv4 only, matching
-                    // the UDP main-socket fallback.
-                    Err(e) => {
-                        log::warn!("IPv6 TCP listener unavailable, using IPv4 only: {e}");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            (Some(tcp_v4), tcp_v6)
+        let tcp_listener = if let Some(port) = config.tcp_port {
+            Some(bind_tcp(
+                port,
+                udp_v4_port,
+                config.enable_ipv6,
+                config.default_interface.as_ref(),
+            )?)
         } else {
-            (None, None)
+            None
         };
 
-        let local_tcp_port = tcp_listener
-            .as_ref()
-            .and_then(|l| l.local_addr().ok())
-            .map(|a| a.port())
-            .unwrap_or(0);
-        let local_tcp_port_v6 = tcp_listener_v6
-            .as_ref()
-            .and_then(|l| l.local_addr().ok())
-            .map(|a| a.port());
+        let local_tcp_addr = tcp_listener.as_ref().and_then(|l| l.local_addr().ok());
 
         let incoming = Self {
             pool,
             tunnel_rx,
             config,
-            local_tcp_port,
-            local_tcp_port_v6,
+            local_tcp_addr,
         };
 
-        // Start a TCP accept loop per listener, mirroring the per-socket task
-        // model already used for UDP.
+        // Start the TCP accept loop.
         if let Some(tcp_listener) = tcp_listener {
-            spawn_tcp_accept_loop(
-                tcp_listener,
-                incoming.pool.clone(),
-                incoming.config.default_interface.clone(),
-            );
-        }
-        if let Some(tcp_listener) = tcp_listener_v6 {
             spawn_tcp_accept_loop(
                 tcp_listener,
                 incoming.pool.clone(),
@@ -153,7 +116,11 @@ impl TunnelIncoming {
     ///
     /// The handle also provides raw UDP sends, socket queries, and NAT discovery.
     pub fn puncher(&self) -> crate::punch::Puncher {
-        crate::punch::Puncher::new(self.pool.clone(), &self.config, self.local_tcp_port)
+        crate::punch::Puncher::new(
+            self.pool.clone(),
+            &self.config,
+            self.local_tcp_addr.map(|a| a.port()).unwrap_or(0),
+        )
     }
 
     /// Get local UDP ports.
@@ -165,17 +132,13 @@ impl TunnelIncoming {
             .collect()
     }
 
-    /// Get the local IPv4 TCP port (the actual bound port, not config value).
-    pub fn local_tcp_port(&self) -> u16 {
-        self.local_tcp_port
-    }
-
-    /// Get the local IPv6 TCP port, when an IPv6 listener is active.
+    /// The local TCP listener address, `None` when TCP handling is disabled.
     ///
-    /// `None` means IPv6 was disabled or unavailable and only IPv4 TCP is
-    /// listened on.
-    pub fn local_tcp_port_v6(&self) -> Option<u16> {
-        self.local_tcp_port_v6
+    /// A dual-stack listener reports `[::]` on the shared port; when IPv6 was
+    /// disabled or unavailable on the host and binding silently downgraded to
+    /// IPv4 only, it reports an IPv4 address instead.
+    pub fn local_tcp_addr(&self) -> Option<SocketAddr> {
+        self.local_tcp_addr
     }
 }
 
@@ -329,44 +292,58 @@ fn spawn_tcp_accept_loop(
     });
 }
 
-/// Bind TCP to the configured port. A zero port first reuses the matching
-/// family's main UDP port, keeping the externally visible protocol ports
-/// aligned when possible. Only an address conflict triggers a fallback to an
-/// OS-assigned port; other errors are returned to the caller.
+/// Bind the TCP listener. With IPv6 enabled the listener is dual-stack on
+/// `[::]`, serving both families from one port; otherwise it binds `0.0.0.0`.
+/// A zero configured port first reuses the main UDP port; an address conflict
+/// then falls back to an OS-assigned port, while other errors are returned to
+/// the caller. A failed dual-stack bind (e.g. no IPv6 support on the host) is
+/// a silent downgrade to IPv4 only.
 fn bind_tcp(
     configured_port: u16,
     udp_port: u16,
+    enable_ipv6: bool,
     default_interface: Option<&LocalInterface>,
-    v6: bool,
 ) -> io::Result<TcpListener> {
     let preferred_port = if configured_port == 0 {
         udp_port
     } else {
         configured_port
     };
+    if enable_ipv6 {
+        match crate::socket::bind_tcp_listener(dual_addr(preferred_port), default_interface) {
+            Ok(listener) => return Ok(listener),
+            Err(error) if configured_port == 0 && is_tcp_port_conflict(&error) => {
+                log::debug!(
+                    "TCP port {preferred_port} is occupied, falling back to an OS-assigned port"
+                );
+                return crate::socket::bind_tcp_listener(dual_addr(0), default_interface);
+            }
+            Err(e) => {
+                log::warn!("IPv6 TCP listener unavailable, using IPv4 only: {e}");
+            }
+        }
+    }
 
-    match crate::socket::bind_tcp_listener(tcp_wildcard_addr(preferred_port, v6), default_interface)
-    {
+    match crate::socket::bind_tcp_listener(v4_addr(preferred_port), default_interface) {
         Ok(listener) => Ok(listener),
         Err(error) if configured_port == 0 && is_tcp_port_conflict(&error) => {
             log::debug!(
                 "TCP port {preferred_port} is occupied, falling back to an OS-assigned port"
             );
-            crate::socket::bind_tcp_listener(tcp_wildcard_addr(0, v6), default_interface)
+            crate::socket::bind_tcp_listener(v4_addr(0), default_interface)
         }
         Err(error) => Err(error),
     }
 }
 
-/// Wildcard listener address for the given family: `0.0.0.0` for IPv4 and
-/// `[::]` (IPv6-only, see `socket::bind_tcp_listener`) for IPv6, so both
-/// listeners of the two-family pair can share one port.
-fn tcp_wildcard_addr(port: u16, v6: bool) -> SocketAddr {
-    if v6 {
-        SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port))
-    } else {
-        SocketAddr::from(([0, 0, 0, 0], port))
-    }
+/// Wildcard listener address for a dual-stack socket: `[::]`.
+fn dual_addr(port: u16) -> SocketAddr {
+    SocketAddr::from(([0; 16], port))
+}
+
+/// Wildcard IPv4 listener address: `0.0.0.0`.
+fn v4_addr(port: u16) -> SocketAddr {
+    SocketAddr::from(([0, 0, 0, 0], port))
 }
 
 fn is_tcp_port_conflict(error: &io::Error) -> bool {
@@ -412,9 +389,9 @@ mod tests {
                 .await
                 .unwrap();
 
-        assert_ne!(listener.local_tcp_port(), 0);
+        assert_ne!(listener.local_tcp_addr().unwrap().port(), 0);
         assert_eq!(
-            listener.local_tcp_port(),
+            listener.local_tcp_addr().unwrap().port(),
             listener.local_addr().unwrap().port()
         );
     }
@@ -433,8 +410,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(listener.local_addr().unwrap().port(), occupied_port);
-        assert_ne!(listener.local_tcp_port(), 0);
-        assert_ne!(listener.local_tcp_port(), occupied_port);
+        assert_ne!(listener.local_tcp_addr().unwrap().port(), 0);
+        assert_ne!(listener.local_tcp_addr().unwrap().port(), occupied_port);
     }
 
     #[tokio::test]
@@ -482,7 +459,10 @@ mod tests {
         let nat_info = puncher.nat_info().await.unwrap();
         assert_eq!(nat_info.mapping_tcp_addr, vec![mapping_tcp_addr]);
         assert_eq!(nat_info.mapping_udp_addr, vec![mapping_udp_addr]);
-        assert_eq!(nat_info.local_tcp_port, listener.local_tcp_port());
+        assert_eq!(
+            nat_info.local_tcp_port,
+            listener.local_tcp_addr().unwrap().port()
+        );
         assert_eq!(nat_info.local_udp_ports, listener.local_udp_ports());
     }
 
@@ -606,7 +586,10 @@ mod tests {
         let mut server = TunnelIncoming::bind(Config::tcp(0).enable_ipv6(false))
             .await
             .unwrap();
-        let target = SocketAddr::new("127.0.0.1".parse().unwrap(), server.local_tcp_port());
+        let target = SocketAddr::new(
+            "127.0.0.1".parse().unwrap(),
+            server.local_tcp_addr().unwrap().port(),
+        );
 
         let mut client = TcpStream::connect(target).await.unwrap();
         let mut server_tunnel = server.next().await.unwrap();
@@ -640,13 +623,16 @@ mod tests {
         let mut server = TunnelIncoming::bind(Config::tcp(0).enable_ipv6(true))
             .await
             .unwrap();
-        let Some(v6_port) = server.local_tcp_port_v6() else {
-            // Host without IPv6 support: silently downgraded to IPv4 only.
+        let Some(addr) = server.local_tcp_addr() else {
             return;
         };
+        if addr.is_ipv4() {
+            // Host without IPv6 support: silently downgraded to IPv4 only.
+            return;
+        }
 
         // An IPv6 connection is accepted and tunneled like any other TCP stream.
-        let target = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], v6_port));
+        let target = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], addr.port()));
         let mut client = TcpStream::connect(target).await.unwrap();
         let mut server_tunnel = server.next().await.unwrap();
         assert!(server_tunnel.is_tcp());
@@ -667,13 +653,50 @@ mod tests {
         assert_eq!(&payload, b"pong");
 
         // The IPv4 listener stays available alongside, sharing one port.
-        let v4_target = SocketAddr::new("127.0.0.1".parse().unwrap(), server.local_tcp_port());
+        let v4_target = SocketAddr::new(
+            "127.0.0.1".parse().unwrap(),
+            server.local_tcp_addr().unwrap().port(),
+        );
         let mut v4_client = TcpStream::connect(v4_target).await.unwrap();
         let mut v4_tunnel = server.next().await.unwrap();
         assert!(v4_tunnel.remote_addr().is_ipv4());
         v4_client.write_all(&2_u32.to_be_bytes()).await.unwrap();
         v4_client.write_all(b"v4").await.unwrap();
         assert_eq!(&v4_tunnel.recv().await.unwrap()[..], b"v4");
+    }
+
+    /// On Windows a dual-stack `[::]` listener with `SO_REUSEADDR` coexists
+    /// with any other socket holding the same port, so the conflict fallback
+    /// is a unix-semantics behavior and only tested there.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn tcp_dual_stack_falls_back_when_the_udp_port_is_taken() {
+        // Another TCP process holds the UDP port. Block the port with a
+        // plain listener bound to `[::]` itself — that conflicts with our
+        // dual-stack bind on unix; the listener then falls back to an
+        // OS-assigned port while still serving both families.
+        let blocker = std::net::TcpListener::bind(SocketAddr::from(([0; 16], 0))).unwrap();
+        let occupied_port = blocker.local_addr().unwrap().port();
+        let server = TunnelIncoming::bind(
+            Config::new()
+                .udp_port(occupied_port)
+                .tcp_port(0)
+                .enable_ipv6(true),
+        )
+        .await
+        .unwrap();
+
+        // UDP still binds the occupied port (TCP blocker does not block UDP).
+        assert_eq!(server.local_addr().unwrap().port(), occupied_port);
+        let Some(addr) = server.local_tcp_addr() else {
+            return;
+        };
+        if addr.is_ipv4() {
+            // Host without IPv6 support: nothing to pair.
+            return;
+        }
+        // The TCP listener moved off the occupied port.
+        assert_ne!(addr.port(), occupied_port);
     }
 
     #[tokio::test]

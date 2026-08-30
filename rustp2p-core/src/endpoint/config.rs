@@ -26,8 +26,9 @@ pub struct Config {
     pub(crate) mapping_tcp_addr: Vec<SocketAddr>,
     pub(crate) mapping_udp_addr: Vec<SocketAddr>,
     pub(crate) default_interface: Option<LocalInterface>,
-    /// Whether to also bind IPv6 sockets. When true but the system has no
-    /// IPv6 support, binding silently falls back to IPv4 only.
+    /// Whether to also serve IPv6. When true, the main UDP pair includes an IPv6
+    /// socket and the TCP listener is dual-stack on `[::]`; when the system
+    /// has no IPv6 support, binding silently falls back to IPv4 only.
     pub(crate) enable_ipv6: bool,
     /// Maximum UDP datagram size the listener can receive.
     pub(crate) max_udp_datagram_size: usize,
@@ -78,8 +79,8 @@ impl Config {
 
     /// Enables TCP on `port`. When `port` is zero, binding first tries the
     /// actual main UDP port and falls back to an OS-assigned port if that TCP
-    /// port is already occupied. With [`enable_ipv6`](Self::enable_ipv6), an
-    /// IPv6-only listener is also bound and shares the same port.
+    /// port is already occupied. With [`enable_ipv6`](Self::enable_ipv6), the
+    /// listener is dual-stack and serves both families on one port.
     pub fn tcp_port(mut self, port: u16) -> Self {
         self.tcp_port = Some(port);
         self

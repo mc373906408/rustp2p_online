@@ -115,7 +115,8 @@ pub fn bind_udp(
 }
 
 /// Binds a non-blocking TCP listener, applying the configured interface before
-/// the socket is bound.
+/// the socket is bound. IPv6 addresses are bound dual-stack (`IPV6_V6ONLY`
+/// off), so a `[::]` listener serves both families.
 pub(crate) fn bind_tcp_listener(
     addr: SocketAddr,
     default_interface: Option<&LocalInterface>,
@@ -128,7 +129,9 @@ pub(crate) fn bind_tcp_listener(
     };
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(Protocol::TCP))?;
     if is_ipv6 {
-        socket.set_only_v6(true)?;
+        // Explicit dual-stack: the platform default differs (Windows binds
+        // v6-only unless asked otherwise).
+        socket.set_only_v6(false)?;
     }
     if let Some(default_interface) = default_interface {
         socket.set_ip_unicast_if(default_interface, is_ipv6)?;

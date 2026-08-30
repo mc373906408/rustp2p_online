@@ -208,6 +208,12 @@ impl SocketPool {
         stream: tokio::net::TcpStream,
         peer_addr: SocketAddr,
     ) -> io::Result<Tunnel> {
+        // A dual-stack listener reports IPv4 peers as IPv4-mapped `::ffff:`
+        // addresses. A TCP connection's peer address is fixed for its whole
+        // life, so canonicalizing once at the tunnel boundary keeps the route
+        // key and `remote_addr` consistent with the view of a real IPv4
+        // socket (and with the outbound punch path).
+        let peer_addr = SocketAddr::new(peer_addr.ip().to_canonical(), peer_addr.port());
         let (read_half, mut write_half) = stream.into_split();
         let local_addr = read_half
             .local_addr()

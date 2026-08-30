@@ -117,7 +117,7 @@ struct CoreTransportLayer {
     // as reported by the core socket itself. Used to build RouteKeys that
     // match the ones produced from received packets.
     raw_local_addr: SocketAddr,
-    local_tcp_port: u16,
+    local_tcp_addr: Option<SocketAddr>,
     raw_tx: flume::Sender<RawTransportPacket>,
     routes: parking_lot::RwLock<Option<RouteTable<PeerId>>>,
     // Cache of live per-tunnel actor senders keyed by RouteKey.
@@ -157,7 +157,9 @@ impl CoreTransportLayer {
 
         let incoming = TunnelIncoming::bind(core_config).await?;
         let puncher = incoming.puncher();
-        let local_tcp_port = incoming.local_tcp_port();
+        let local_tcp_addr = incoming
+            .local_tcp_addr()
+            .map(|addr| normalize_local_addr(addr, config.bind_addr));
         let raw_local_addr = incoming.local_addr()?;
         let local_addr = normalize_local_addr(raw_local_addr, config.bind_addr);
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
@@ -165,7 +167,7 @@ impl CoreTransportLayer {
             puncher,
             local_addr,
             raw_local_addr,
-            local_tcp_port,
+            local_tcp_addr,
             raw_tx,
             routes: parking_lot::RwLock::new(None),
             tunnels: DashMap::new(),
@@ -199,8 +201,7 @@ impl CoreTransportLayer {
     }
 
     fn local_tcp_addr(&self) -> Option<SocketAddr> {
-        (self.local_tcp_port != 0)
-            .then(|| SocketAddr::new(self.local_addr.ip(), self.local_tcp_port))
+        self.local_tcp_addr
     }
 
     async fn send_raw_to_addr(&self, buf: &[u8], addr: SocketAddr) -> io::Result<()> {
