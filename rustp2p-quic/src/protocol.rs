@@ -1066,11 +1066,11 @@ impl ProtocolLayer {
             self.max_ttl,
             &payload,
         )?;
-        let bytes = packet.as_bytes().to_vec();
+        let bytes = Bytes::from(packet.as_bytes().to_vec());
         self.transport
             .punch(
-                Some(bytes.as_slice()),
-                bytes.as_slice(),
+                Some(bytes.clone()),
+                bytes,
                 PunchInfo::new(PunchModel::all(), peer_nat_info),
             )
             .await

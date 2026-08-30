@@ -221,8 +221,8 @@ impl CoreTransportLayer {
 
     async fn punch(
         &self,
-        tcp_buf: Option<&[u8]>,
-        udp_buf: &[u8],
+        tcp_buf: Option<Bytes>,
+        udp_buf: Bytes,
         punch_info: PunchInfo,
     ) -> io::Result<()> {
         self.puncher.punch_now(tcp_buf, udp_buf, punch_info).await
@@ -573,8 +573,8 @@ impl TransportLayer {
 
     pub(crate) async fn punch(
         &self,
-        tcp_buf: Option<&[u8]>,
-        udp_buf: &[u8],
+        tcp_buf: Option<Bytes>,
+        udp_buf: Bytes,
         punch_info: PunchInfo,
     ) -> io::Result<()> {
         self.core.punch(tcp_buf, udp_buf, punch_info).await

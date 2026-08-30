@@ -135,6 +135,24 @@ impl Puncher {
         self.pool.udp_sockets()
     }
 
+    /// Connects to `addr` and publishes the resulting TCP connection as an
+    /// incoming tunnel.
+    ///
+    /// The connection is established through the configured default
+    /// interface. `initial_data`, when present, is sent to the peer before
+    /// the tunnel is published, replaying leading bytes that were consumed
+    /// while the connection was established.
+    pub async fn connect_tcp(
+        &self,
+        addr: SocketAddr,
+        initial_data: Option<Bytes>,
+    ) -> io::Result<()> {
+        let stream =
+            crate::socket::connect_tcp(addr, 0, self.nat_config.default_interface.as_ref(), None)
+                .await?;
+        self.pool.publish_tcp(stream, addr, initial_data).await
+    }
+
     /// Gets NAT information using the STUN and mapping configuration captured
     /// when this puncher was created.
     pub async fn nat_info(&self) -> io::Result<NatInfo> {
@@ -276,11 +294,11 @@ impl Puncher {
     ///
     /// Note: like [`Puncher::punch_now`], the returned future is
     /// long-running; spawn it instead of awaiting it inline.
-    pub async fn punch(&self, buf: &[u8], punch_info: PunchInfo) -> io::Result<()> {
+    pub async fn punch(&self, buf: Bytes, punch_info: PunchInfo) -> io::Result<()> {
         if !self.need_punch(&punch_info) {
             return Ok(());
         }
-        self.punch_now(None, buf, punch_info).await
+        self.punch_now(Some(buf.clone()), buf, punch_info).await
     }
 
     /// Runs one full punch round, ignoring the backoff schedule.
@@ -293,8 +311,8 @@ impl Puncher {
     /// other protocol processing for the duration of the round.
     pub async fn punch_now(
         &self,
-        tcp_buf: Option<&[u8]>,
-        udp_buf: &[u8],
+        tcp_buf: Option<Bytes>,
+        udp_buf: Bytes,
         punch_info: PunchInfo,
     ) -> io::Result<()> {
         let peer = punch_info
@@ -331,12 +349,12 @@ impl Puncher {
         let punch_model = punch_info.punch_model;
 
         // UDP punch
-        self.punch_udp(count, udp_buf, &peer_nat_info, &punch_model)
+        self.punch_udp(count, &udp_buf, &peer_nat_info, &punch_model)
             .await;
 
         // TCP punch
         let mut tcp_tasks = Vec::new();
-        let tcp_buf_owned: Option<Arc<[u8]>> = tcp_buf.map(Arc::from);
+        let tcp_buf_owned = tcp_buf;
         if !peer_nat_info.mapping_tcp_addr.is_empty() {
             for addr in &peer_nat_info.mapping_tcp_addr {
                 let buf = tcp_buf_owned.clone();
@@ -344,7 +362,7 @@ impl Puncher {
                 let puncher = self.clone();
                 tcp_tasks.push(tokio::spawn(async move {
                     puncher
-                        .connect_tcp(buf.as_deref(), a, ttl, Duration::from_secs(3))
+                        .connect_tcp_punch(buf, a, ttl, Duration::from_secs(3))
                         .await;
                 }));
             }
@@ -355,7 +373,7 @@ impl Puncher {
                 let puncher = self.clone();
                 tcp_tasks.push(tokio::spawn(async move {
                     puncher
-                        .connect_tcp(buf.as_deref(), addr, ttl, Duration::from_millis(100))
+                        .connect_tcp_punch(buf, addr, ttl, Duration::from_millis(100))
                         .await;
                 }));
             }
@@ -364,7 +382,7 @@ impl Puncher {
                 let puncher = self.clone();
                 tcp_tasks.push(tokio::spawn(async move {
                     puncher
-                        .connect_tcp(buf.as_deref(), addr, ttl, Duration::from_secs(3))
+                        .connect_tcp_punch(buf, addr, ttl, Duration::from_secs(3))
                         .await;
                 }));
             }
@@ -375,7 +393,7 @@ impl Puncher {
                 let puncher = self.clone();
                 tcp_tasks.push(tokio::spawn(async move {
                     puncher
-                        .connect_tcp(buf.as_deref(), addr, ttl, Duration::from_secs(3))
+                        .connect_tcp_punch(buf, addr, ttl, Duration::from_secs(3))
                         .await;
                 }));
             }
@@ -386,9 +404,9 @@ impl Puncher {
         Ok(())
     }
 
-    async fn connect_tcp(
+    async fn connect_tcp_punch(
         &self,
-        buf: Option<&[u8]>,
+        buf: Option<Bytes>,
         addr: SocketAddr,
         ttl: Option<u8>,
         timeout: Duration,
@@ -401,7 +419,7 @@ impl Puncher {
                 ttl,
             )
             .await?;
-            let initial_data = buf.map(Bytes::copy_from_slice);
+            let initial_data = buf;
             self.pool.publish_tcp(stream, addr, initial_data).await
         })
         .await

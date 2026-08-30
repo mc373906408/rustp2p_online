@@ -225,7 +225,10 @@ impl ContextHandler {
                     let puncher = self.puncher.clone();
                     tokio::spawn(async move {
                         let rs = puncher
-                            .punch(&request, PunchInfo::new(PunchModel::all(), peer_nat_info))
+                            .punch(
+                                request.freeze(),
+                                PunchInfo::new(PunchModel::all(), peer_nat_info),
+                            )
                             .await;
                         log::info!("punch peer_id={src_id},{rs:?}")
                     });
@@ -242,7 +245,10 @@ impl ContextHandler {
                 let puncher = self.puncher.clone();
                 tokio::spawn(async move {
                     let rs = puncher
-                        .punch(&request, PunchInfo::new(PunchModel::all(), peer_nat_info))
+                        .punch(
+                            request.freeze(),
+                            PunchInfo::new(PunchModel::all(), peer_nat_info),
+                        )
                         .await;
                     log::info!("punch peer_id={src_id},{rs:?}")
                 });
