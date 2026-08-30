@@ -120,16 +120,6 @@ pub(crate) fn bind_tcp_listener(
     addr: SocketAddr,
     default_interface: Option<&LocalInterface>,
 ) -> io::Result<tokio::net::TcpListener> {
-    // Preserve the platform defaults used by std/Tokio when no interface is
-    // requested. In particular, Windows has stricter port-allocation behavior
-    // for manually created listener sockets around recently used ephemeral
-    // ports.
-    if default_interface.is_none() {
-        let listener = std::net::TcpListener::bind(addr)?;
-        listener.set_nonblocking(true)?;
-        return tokio::net::TcpListener::from_std(listener);
-    }
-
     let is_ipv6 = addr.is_ipv6();
     let domain = if is_ipv6 {
         socket2::Domain::IPV6
@@ -143,6 +133,9 @@ pub(crate) fn bind_tcp_listener(
     if let Some(default_interface) = default_interface {
         socket.set_ip_unicast_if(default_interface, is_ipv6)?;
     }
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
@@ -238,19 +231,39 @@ pub(crate) fn create_tcp0(
     tokio::net::TcpStream::from_std(socket.into())
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+#[cfg(test)]
 mod tests {
-    use super::{bind_tcp_listener, bind_udp, create_tcp0, LocalInterface};
+    use super::{bind_tcp_listener, create_tcp0};
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use super::{bind_udp, LocalInterface};
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn missing_interface() -> LocalInterface {
         LocalInterface::new("rp2pnone".to_owned())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn socket_creation_applies_default_interface() {
         let interface = missing_interface();
         assert!(bind_udp("0.0.0.0:0".parse().unwrap(), Some(&interface)).is_err());
         assert!(bind_tcp_listener("0.0.0.0:0".parse().unwrap(), Some(&interface)).is_err());
         assert!(create_tcp0("127.0.0.1:9".parse().unwrap(), 0, Some(&interface), None).is_err());
+    }
+
+    #[tokio::test]
+    async fn tcp_listener_port_can_be_reused_by_outbound_connection() {
+        let listener = bind_tcp_listener("0.0.0.0:0".parse().unwrap(), None).unwrap();
+        let local_port = listener.local_addr().unwrap().port();
+        let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote_listener.local_addr().unwrap();
+
+        let stream = create_tcp0(remote_addr, local_port, None, None).unwrap();
+        stream.writable().await.unwrap();
+        assert!(stream.take_error().unwrap().is_none());
+        let (_, peer_addr) = remote_listener.accept().await.unwrap();
+
+        assert_eq!(stream.local_addr().unwrap().port(), local_port);
+        assert_eq!(peer_addr.port(), local_port);
     }
 }
