@@ -152,6 +152,16 @@ pub struct TunnelWriteHalf {
     route_key: RouteKey,
 }
 
+/// Maps an outbound queue `try_send` failure onto an `io::Error`: full queues
+/// yield `WouldBlock` (the data was dropped), closed channels yield a
+/// transport-specific message.
+fn map_send_error<T>(error: mpsc::error::TrySendError<T>, closed: &str) -> io::Error {
+    match error {
+        mpsc::error::TrySendError::Full(_) => io::Error::from(io::ErrorKind::WouldBlock),
+        mpsc::error::TrySendError::Closed(_) => io::Error::other(closed),
+    }
+}
+
 impl Tunnel {
     pub(crate) fn udp(
         write_tx: mpsc::Sender<(Bytes, SocketAddr)>,
@@ -209,6 +219,23 @@ impl Tunnel {
         self.writer.send(data).await
     }
 
+    /// Sends data to this tunnel's peer without blocking.
+    ///
+    /// Returns [`io::ErrorKind::WouldBlock`] when the outbound queue is full;
+    /// the data is then dropped and must be retried by the caller.
+    pub fn try_send(&self, data: Bytes) -> io::Result<()> {
+        self.writer.try_send(data)
+    }
+
+    /// Receives the next datagram or decoded TCP frame without blocking.
+    ///
+    /// Returns `None` when the tunnel is closed (matching
+    /// [`Self::recv`]), and [`io::ErrorKind::WouldBlock`] when no data
+    /// is available yet.
+    pub fn try_recv(&mut self) -> io::Result<Option<BytesMut>> {
+        self.reader.try_recv()
+    }
+
     pub fn protocol(&self) -> Protocol {
         self.writer.protocol()
     }
@@ -238,6 +265,21 @@ impl TunnelReadHalf {
     /// Receives the next datagram or decoded TCP frame.
     pub async fn recv(&mut self) -> Option<BytesMut> {
         self.data_rx.recv().await
+    }
+
+    /// Receives the next datagram or decoded TCP frame without blocking.
+    ///
+    /// Returns `None` when the tunnel is closed (matching
+    /// [`Self::recv`]), and [`io::ErrorKind::WouldBlock`] when no data
+    /// is available yet.
+    pub fn try_recv(&mut self) -> io::Result<Option<BytesMut>> {
+        match self.data_rx.try_recv() {
+            Ok(data) => Ok(Some(data)),
+            Err(mpsc::error::TryRecvError::Empty) => {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => Ok(None),
+        }
     }
 
     pub fn protocol(&self) -> Protocol {
@@ -277,6 +319,21 @@ impl TunnelWriteHalf {
                 .send(data)
                 .await
                 .map_err(|_| io::Error::other("TCP connection closed")),
+        }
+    }
+
+    /// Sends data to this tunnel's peer without blocking.
+    ///
+    /// Returns [`io::ErrorKind::WouldBlock`] when the outbound queue is full;
+    /// the data is then dropped and must be retried by the caller.
+    pub fn try_send(&self, data: Bytes) -> io::Result<()> {
+        match &self.inner {
+            TunnelWriterInner::Udp(write_tx) => write_tx
+                .try_send((data, self.remote_addr()))
+                .map_err(|error| map_send_error(error, "UDP socket dropped")),
+            TunnelWriterInner::Tcp(write_tx) => write_tx
+                .try_send(data)
+                .map_err(|error| map_send_error(error, "TCP connection closed")),
         }
     }
 
