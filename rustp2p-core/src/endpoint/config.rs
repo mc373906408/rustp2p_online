@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use crate::endpoint::codec::InitCodec;
 use crate::socket::LocalInterface;
@@ -23,8 +22,6 @@ pub struct Config {
     pub(crate) udp_port: Option<u16>,
     pub(crate) tcp_port: Option<u16>,
     pub(crate) tcp_codec: Option<Box<dyn InitCodec>>,
-    pub(crate) load_balance: LoadBalance,
-    pub(crate) route_idle_timeout: Duration,
     pub(crate) max_assistant_sockets: usize,
     pub(crate) mapping_tcp_addr: Vec<SocketAddr>,
     pub(crate) mapping_udp_addr: Vec<SocketAddr>,
@@ -43,8 +40,6 @@ impl Default for Config {
             udp_port: Some(0),
             tcp_port: Some(0),
             tcp_codec: None,
-            load_balance: LoadBalance::MinHopLowestLatency,
-            route_idle_timeout: Duration::from_secs(12),
             max_assistant_sockets: 0,
             mapping_tcp_addr: vec![],
             mapping_udp_addr: vec![],
@@ -96,16 +91,6 @@ impl Config {
 
     pub fn stun_servers(mut self, servers: Vec<String>) -> Self {
         self.stun_servers = servers;
-        self
-    }
-
-    pub fn load_balance(mut self, lb: LoadBalance) -> Self {
-        self.load_balance = lb;
-        self
-    }
-
-    pub fn route_idle_timeout(mut self, timeout: Duration) -> Self {
-        self.route_idle_timeout = timeout;
         self
     }
 

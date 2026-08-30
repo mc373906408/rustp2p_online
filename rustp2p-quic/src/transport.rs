@@ -153,7 +153,6 @@ impl CoreTransportLayer {
             .stun_servers(config.stun_servers.clone())
             .mapping_udp_addr(config.mapping_udp_addrs.clone())
             .mapping_tcp_addr(config.mapping_tcp_addrs.clone())
-            .load_balance(config.load_balance)
             .max_assistant_sockets(config.max_assistant_sockets);
 
         let incoming = TunnelIncoming::bind(core_config).await?;
