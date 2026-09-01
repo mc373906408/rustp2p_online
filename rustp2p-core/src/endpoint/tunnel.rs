@@ -3,7 +3,7 @@ use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::{broadcast, mpsc};
 
@@ -13,21 +13,21 @@ use crate::route_table::{Protocol, RouteKey};
 pub(crate) const TUNNEL_CHANNEL_CAPACITY: usize = 128;
 
 struct UdpRegistration {
-    id: u64,
+    id: usize,
     data_tx: mpsc::Sender<BytesMut>,
 }
 
 /// Routes datagrams from shared UDP sockets to their five-tuple tunnel.
 pub(crate) struct UdpDispatcher {
     routes: DashMap<RouteKey, UdpRegistration>,
-    next_id: AtomicU64,
+    next_id: AtomicUsize,
 }
 
 impl UdpDispatcher {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             routes: DashMap::new(),
-            next_id: AtomicU64::new(1),
+            next_id: AtomicUsize::new(1),
         })
     }
 
@@ -92,7 +92,7 @@ impl UdpDispatcher {
         }
     }
 
-    fn unregister(&self, route_key: RouteKey, id: u64) {
+    fn unregister(&self, route_key: RouteKey, id: usize) {
         if let Entry::Occupied(entry) = self.routes.entry(route_key) {
             if entry.get().id == id {
                 entry.remove();
@@ -119,7 +119,7 @@ enum TunnelWriterInner {
 enum TunnelReadLifecycle {
     Udp {
         dispatcher: Weak<UdpDispatcher>,
-        id: u64,
+        id: usize,
     },
     Tcp {
         _read_shutdown: broadcast::Sender<()>,
@@ -168,7 +168,7 @@ impl Tunnel {
         route_key: RouteKey,
         data_rx: mpsc::Receiver<BytesMut>,
         dispatcher: Weak<UdpDispatcher>,
-        id: u64,
+        id: usize,
     ) -> Self {
         Self {
             reader: TunnelReadHalf {
