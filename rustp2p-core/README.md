@@ -18,6 +18,7 @@ application datagrams, reliable streams, discovery, and relay forwarding, use
 - Cloneable `Puncher` for raw UDP sends, socket queries, NAT discovery, and punching.
 - Consistent `Config::default_interface` selection for main/assistant UDP,
   TCP listener/punch connections, IPv4/IPv6, and STUN sockets.
+- Explicit IPv4/IPv6 local-address binding for listeners, punching, and STUN.
 - TCP framing through configurable codecs.
 - Route table utilities with multiple routes per peer id and load balancing.
 - STUN-based NAT type and port-range detection when explicitly configured.
@@ -74,6 +75,30 @@ async fn main() -> std::io::Result<()> {
 
     Ok(())
 }
+```
+
+### Bind Local Addresses
+
+Bind one or both address families independently. IPv6 binding remains subject
+to `enable_ipv6` (enabled by default).
+
+```rust,no_run
+use std::net::{Ipv4Addr, Ipv6Addr};
+use rustp2p_core::endpoint::{Config, TunnelIncoming};
+
+# #[tokio::main]
+# async fn main() -> std::io::Result<()> {
+let incoming = TunnelIncoming::bind(
+    Config::new()
+        .bind_ipv4(Ipv4Addr::new(192, 0, 2, 10))
+        .bind_ipv6("2001:db8::10".parse::<Ipv6Addr>().unwrap()),
+)
+.await?;
+
+println!("IPv4 TCP: {:?}", incoming.local_tcp_addr());
+println!("IPv6 TCP: {:?}", incoming.local_tcp_ipv6_addr());
+# Ok(())
+# }
 ```
 
 ## NAT And Punching

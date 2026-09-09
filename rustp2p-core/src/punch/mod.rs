@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io;
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,6 +71,9 @@ struct NatQueryConfig {
     mapping_tcp_addr: Vec<SocketAddr>,
     mapping_udp_addr: Vec<SocketAddr>,
     default_interface: Option<crate::socket::LocalInterface>,
+    bind_ipv4: Option<Ipv4Addr>,
+    bind_ipv6: Option<Ipv6Addr>,
+    enable_ipv6: bool,
     local_tcp_port: u16,
     max_assistant_sockets: usize,
 }
@@ -99,6 +102,9 @@ impl Puncher {
                 mapping_tcp_addr: config.mapping_tcp_addr.clone(),
                 mapping_udp_addr: config.mapping_udp_addr.clone(),
                 default_interface: config.default_interface.clone(),
+                bind_ipv4: config.bind_ipv4,
+                bind_ipv6: config.bind_ipv6,
+                enable_ipv6: config.enable_ipv6,
                 local_tcp_port,
                 max_assistant_sockets: config.max_assistant_sockets,
             }),
@@ -147,9 +153,13 @@ impl Puncher {
         addr: SocketAddr,
         initial_data: Option<Bytes>,
     ) -> io::Result<()> {
-        let stream =
-            crate::socket::connect_tcp(addr, 0, self.nat_config.default_interface.as_ref(), None)
-                .await?;
+        let stream = crate::socket::connect_tcp(
+            addr,
+            Some(self.tcp_bind_addr(addr, 0)?),
+            self.nat_config.default_interface.as_ref(),
+            None,
+        )
+        .await?;
         self.pool.publish_tcp(stream, addr, initial_data).await
     }
 
@@ -171,9 +181,12 @@ impl Puncher {
         } else {
             stun_servers
         };
-        let stun_result = crate::stun::stun_test_nat(
+        let stun_result = crate::stun::stun_test_nat_bound(
             stun_servers.to_vec(),
             self.nat_config.default_interface.as_ref(),
+            self.nat_config.bind_ipv4,
+            self.nat_config.bind_ipv6,
+            self.nat_config.enable_ipv6,
         )
         .await?;
 
@@ -191,14 +204,23 @@ impl Puncher {
         // address family that came up empty.
         let interface = self.nat_config.default_interface.as_ref();
         let scanned = crate::util::addr::local_ips(interface);
-        let mut local_ipv4s = scanned.ipv4s;
+        let mut local_ipv4s: Vec<Ipv4Addr> = self.nat_config.bind_ipv4.into_iter().collect();
+        if local_ipv4s.is_empty() {
+            local_ipv4s = scanned.ipv4s;
+        }
         if local_ipv4s.is_empty() {
             if let Some(ip) = crate::util::addr::local_ipv4(interface, stun_servers).await {
                 local_ipv4s.push(ip);
             }
         }
-        let mut ipv6 = scanned.ipv6s.into_iter().next();
-        if ipv6.is_none() {
+        let mut ipv6 = if self.nat_config.enable_ipv6 {
+            self.nat_config
+                .bind_ipv6
+                .or_else(|| scanned.ipv6s.into_iter().next())
+        } else {
+            None
+        };
+        if ipv6.is_none() && self.nat_config.enable_ipv6 {
             ipv6 = crate::util::addr::local_ipv6(interface, stun_servers).await;
         }
         let local_udp_ports = self
@@ -252,7 +274,10 @@ impl Puncher {
                     );
                     for _ in current..target {
                         let socket = crate::socket::bind_udp(
-                            "0.0.0.0:0".parse().unwrap(),
+                            SocketAddr::from((
+                                self.nat_config.bind_ipv4.unwrap_or(Ipv4Addr::UNSPECIFIED),
+                                0,
+                            )),
                             self.nat_config.default_interface.as_ref(),
                         )?;
                         let std_socket: std::net::UdpSocket = socket.into();
@@ -414,7 +439,7 @@ impl Puncher {
         match tokio::time::timeout(timeout, async {
             let stream = crate::socket::connect_tcp(
                 addr,
-                0,
+                Some(self.tcp_bind_addr(addr, 0)?),
                 self.nat_config.default_interface.as_ref(),
                 ttl,
             )
@@ -427,6 +452,23 @@ impl Puncher {
             Ok(Ok(())) => {}
             Ok(Err(e)) => log::warn!("tcp punch error: {e}"),
             Err(_) => log::warn!("tcp punch timeout"),
+        }
+    }
+
+    fn tcp_bind_addr(&self, remote: SocketAddr, port: u16) -> io::Result<SocketAddr> {
+        match remote {
+            SocketAddr::V4(_) => Ok(SocketAddr::from((
+                self.nat_config.bind_ipv4.unwrap_or(Ipv4Addr::UNSPECIFIED),
+                port,
+            ))),
+            SocketAddr::V6(_) if self.nat_config.enable_ipv6 => Ok(SocketAddr::from((
+                self.nat_config.bind_ipv6.unwrap_or(Ipv6Addr::UNSPECIFIED),
+                port,
+            ))),
+            SocketAddr::V6(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "IPv6 TCP is disabled by Config::enable_ipv6",
+            )),
         }
     }
 

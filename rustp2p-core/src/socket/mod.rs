@@ -119,6 +119,7 @@ pub fn bind_udp(
 /// off), so a `[::]` listener serves both families.
 pub(crate) fn bind_tcp_listener(
     addr: SocketAddr,
+    only_v6: bool,
     default_interface: Option<&LocalInterface>,
 ) -> io::Result<tokio::net::TcpListener> {
     let is_ipv6 = addr.is_ipv6();
@@ -131,7 +132,7 @@ pub(crate) fn bind_tcp_listener(
     if is_ipv6 {
         // Explicit dual-stack: the platform default differs (Windows binds
         // v6-only unless asked otherwise).
-        socket.set_only_v6(false)?;
+        socket.set_only_v6(only_v6)?;
     }
     if let Some(default_interface) = default_interface {
         socket.set_ip_unicast_if(default_interface, is_ipv6)?;
@@ -163,11 +164,11 @@ const TCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 
 pub(crate) async fn connect_tcp(
     addr: SocketAddr,
-    bind_port: u16,
+    bind_addr: Option<SocketAddr>,
     default_interface: Option<&LocalInterface>,
     ttl: Option<u8>,
 ) -> io::Result<tokio::net::TcpStream> {
-    let socket = create_tcp0(addr, bind_port, default_interface, ttl)?;
+    let socket = create_tcp0(addr, bind_addr, default_interface, ttl)?;
     tokio::time::timeout(TCP_CONNECT_TIMEOUT, socket.writable())
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP connect timed out"))??;
@@ -182,7 +183,7 @@ pub(crate) async fn connect_tcp(
 
 pub(crate) fn create_tcp0(
     addr: SocketAddr,
-    bind_port: u16,
+    bind_addr: Option<SocketAddr>,
     default_interface: Option<&LocalInterface>,
     ttl: Option<u8>,
 ) -> io::Result<tokio::net::TcpStream> {
@@ -203,20 +204,22 @@ pub(crate) fn create_tcp0(
     if let Some(interface) = default_interface {
         socket.set_ip_unicast_if(interface, !v4)?;
     }
-    if bind_port != 0 {
+    if let Some(bind_addr) = bind_addr {
+        if bind_addr.is_ipv4() != v4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "local TCP bind address family differs from remote address",
+            ));
+        }
         _ = socket.set_reuse_address(true);
         #[cfg(unix)]
         {
             _ = socket.set_reuse_port(true);
         }
-        if v4 {
-            let addr: SocketAddr = format!("0.0.0.0:{bind_port}").parse().unwrap();
-            socket.bind(&addr.into())?;
-        } else {
+        if !v4 {
             socket.set_only_v6(true)?;
-            let addr: SocketAddr = format!("[::]:{bind_port}").parse().unwrap();
-            socket.bind(&addr.into())?;
         }
+        socket.bind(&bind_addr.into())?;
     }
     if let Some(ttl) = ttl {
         _ = socket.set_ttl_v4(ttl as _);
@@ -239,6 +242,7 @@ mod tests {
     use super::{bind_tcp_listener, create_tcp0};
     #[cfg(any(target_os = "linux", target_os = "android"))]
     use super::{bind_udp, LocalInterface};
+    use std::net::SocketAddr;
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn missing_interface() -> LocalInterface {
@@ -250,18 +254,24 @@ mod tests {
     fn socket_creation_applies_default_interface() {
         let interface = missing_interface();
         assert!(bind_udp("0.0.0.0:0".parse().unwrap(), Some(&interface)).is_err());
-        assert!(bind_tcp_listener("0.0.0.0:0".parse().unwrap(), Some(&interface)).is_err());
-        assert!(create_tcp0("127.0.0.1:9".parse().unwrap(), 0, Some(&interface), None).is_err());
+        assert!(bind_tcp_listener("0.0.0.0:0".parse().unwrap(), false, Some(&interface)).is_err());
+        assert!(create_tcp0("127.0.0.1:9".parse().unwrap(), None, Some(&interface), None).is_err());
     }
 
     #[tokio::test]
     async fn tcp_listener_port_can_be_reused_by_outbound_connection() {
-        let listener = bind_tcp_listener("0.0.0.0:0".parse().unwrap(), None).unwrap();
+        let listener = bind_tcp_listener("0.0.0.0:0".parse().unwrap(), false, None).unwrap();
         let local_port = listener.local_addr().unwrap().port();
         let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let remote_addr = remote_listener.local_addr().unwrap();
 
-        let stream = create_tcp0(remote_addr, local_port, None, None).unwrap();
+        let stream = create_tcp0(
+            remote_addr,
+            Some(SocketAddr::from(([0, 0, 0, 0], local_port))),
+            None,
+            None,
+        )
+        .unwrap();
         stream.writable().await.unwrap();
         assert!(stream.take_error().unwrap().is_none());
         let (_, peer_addr) = remote_listener.accept().await.unwrap();

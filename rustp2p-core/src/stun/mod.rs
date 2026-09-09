@@ -91,6 +91,17 @@ pub async fn stun_test_nat(
     stun_servers: Vec<String>,
     default_interface: Option<&LocalInterface>,
 ) -> io::Result<StunResult> {
+    stun_test_nat_bound(stun_servers, default_interface, None, None, true).await
+}
+
+/// Tests NAT while binding temporary sockets to configured local addresses.
+pub async fn stun_test_nat_bound(
+    stun_servers: Vec<String>,
+    default_interface: Option<&LocalInterface>,
+    bind_ipv4: Option<Ipv4Addr>,
+    bind_ipv6: Option<Ipv6Addr>,
+    enable_ipv6: bool,
+) -> io::Result<StunResult> {
     let mut nat_type = NatType::Cone;
     let mut port_range = 0;
     let mut ipv4_set = HashSet::new();
@@ -98,7 +109,15 @@ pub async fn stun_test_nat(
     let mut ipv6_addr = None;
     for _ in 0..2 {
         let stun_servers = stun_servers.clone();
-        match stun_test_nat0(stun_servers, default_interface).await {
+        match stun_test_nat0(
+            stun_servers,
+            default_interface,
+            bind_ipv4,
+            bind_ipv6,
+            enable_ipv6,
+        )
+        .await
+        {
             Ok(result) => {
                 if result.nat_type == NatType::Symmetric {
                     nat_type = NatType::Symmetric;
@@ -149,30 +168,81 @@ pub async fn stun_test_nat(
 pub(crate) async fn stun_test_nat0(
     stun_servers: Vec<String>,
     default_interface: Option<&LocalInterface>,
+    bind_ipv4: Option<Ipv4Addr>,
+    bind_ipv6: Option<Ipv6Addr>,
+    enable_ipv6: bool,
 ) -> io::Result<StunResult> {
-    let udp = bind_udp("0.0.0.0:0".parse().unwrap(), default_interface)?;
-    let udp = UdpSocket::from_std(udp.into())?;
-    let mut nat_type = NatType::Cone;
-    let mut min_port = u16::MAX;
-    let mut max_port = 0;
+    let mut udp_v4 = None;
+    let mut udp_v6 = None;
+    let mut ipv6_unavailable = false;
     let mut ipv4_set = HashSet::new();
     let mut public_ports = HashSet::new();
     let mut ipv6_addr = None;
-    let mut pub_addrs = HashSet::new();
+    let mut pub_addrs_v4 = HashSet::new();
+    let mut pub_addrs_v6 = HashSet::new();
     for x in &stun_servers {
-        match test_nat(&udp, x).await {
-            Ok(addr) => {
-                pub_addrs.extend(addr);
+        let server_addrs: Vec<_> = match x.to_socket_addrs() {
+            Ok(addrs) => addrs.collect(),
+            Err(error) => {
+                log::warn!("stun {x} resolve error {error:?}");
+                continue;
             }
-            Err(e) => {
-                log::warn!("stun {x} error {e:?} ");
+        };
+        if server_addrs.is_empty() {
+            log::warn!("stun {x} resolves to no address");
+            continue;
+        }
+        for server_addr in server_addrs {
+            let udp = match server_addr {
+                SocketAddr::V4(_) => {
+                    if udp_v4.is_none() {
+                        let bind_addr =
+                            SocketAddr::from((bind_ipv4.unwrap_or(Ipv4Addr::UNSPECIFIED), 0));
+                        let socket = bind_udp(bind_addr, default_interface)?;
+                        udp_v4 = Some(UdpSocket::from_std(socket.into())?);
+                    }
+                    udp_v4.as_ref().unwrap()
+                }
+                SocketAddr::V6(_) if enable_ipv6 && !ipv6_unavailable => {
+                    if udp_v6.is_none() {
+                        let bind_addr =
+                            SocketAddr::from((bind_ipv6.unwrap_or(Ipv6Addr::UNSPECIFIED), 0));
+                        let socket = match bind_udp(bind_addr, default_interface) {
+                            Ok(socket) => socket,
+                            Err(error) if bind_ipv6.is_none() => {
+                                log::warn!(
+                                    "IPv6 STUN socket unavailable, skipping IPv6 queries: {error}"
+                                );
+                                ipv6_unavailable = true;
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        udp_v6 = Some(UdpSocket::from_std(socket.into())?);
+                    }
+                    udp_v6.as_ref().unwrap()
+                }
+                SocketAddr::V6(_) => continue,
+            };
+            match test_nat(udp, server_addr, x).await {
+                Ok(addrs) => {
+                    for addr in addrs {
+                        match addr {
+                            SocketAddr::V4(_) => {
+                                pub_addrs_v4.insert(addr);
+                            }
+                            SocketAddr::V6(_) => {
+                                pub_addrs_v6.insert(addr);
+                            }
+                        }
+                    }
+                }
+                Err(e) => log::warn!("stun {x} error {e:?} "),
             }
         }
     }
-    if pub_addrs.len() > 1 {
-        nat_type = NatType::Symmetric;
-    }
-    for addr in &pub_addrs {
+    let nat_type = mapped_nat_type(&pub_addrs_v4, &pub_addrs_v6);
+    for addr in pub_addrs_v4.iter().chain(&pub_addrs_v6) {
         match addr {
             SocketAddr::V4(v4) => {
                 ipv4_set.insert(*v4.ip());
@@ -185,37 +255,35 @@ pub(crate) async fn stun_test_nat0(
                 public_ports.insert(v6.port());
             }
         }
-        if min_port > addr.port() {
-            min_port = addr.port()
-        }
-        if max_port < addr.port() {
-            max_port = addr.port()
-        }
     }
     Ok(StunResult {
         nat_type,
         public_ipv4: ipv4_set.into_iter().collect(),
         public_ipv6: ipv6_addr,
         public_udp_ports: public_ports.into_iter().collect(),
-        port_range: max_port.saturating_sub(min_port),
+        port_range: mapped_port_range(&pub_addrs_v4).max(mapped_port_range(&pub_addrs_v6)),
     })
 }
 
-async fn test_nat(udp: &UdpSocket, stun_server: &str) -> io::Result<HashSet<SocketAddr>> {
-    // Resolve to a concrete `SocketAddr` before connecting. Passing the
-    // late-bound `&str` directly to `UdpSocket::connect`, which takes
-    // `impl ToSocketAddrs`, prevents rustc from normalizing this async fn's
-    // opaque future type at generic boundaries (E0308 "one type is more
-    // general than the other").
-    let server_addr = match stun_server.to_socket_addrs()?.next() {
-        Some(addr) => addr,
-        None => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("STUN server resolves to no address: {stun_server}"),
-            ))
-        }
-    };
+fn mapped_port_range(addrs: &HashSet<SocketAddr>) -> u16 {
+    let min = addrs.iter().map(SocketAddr::port).min().unwrap_or(0);
+    let max = addrs.iter().map(SocketAddr::port).max().unwrap_or(0);
+    max.saturating_sub(min)
+}
+
+fn mapped_nat_type(ipv4_addrs: &HashSet<SocketAddr>, ipv6_addrs: &HashSet<SocketAddr>) -> NatType {
+    if ipv4_addrs.len() > 1 || ipv6_addrs.len() > 1 {
+        NatType::Symmetric
+    } else {
+        NatType::Cone
+    }
+}
+
+async fn test_nat(
+    udp: &UdpSocket,
+    server_addr: SocketAddr,
+    stun_server: &str,
+) -> io::Result<HashSet<SocketAddr>> {
     udp.connect(server_addr).await?;
     let tid = rand::rng().next_u64() as u128;
     let mut addr = HashSet::new();
@@ -341,4 +409,70 @@ pub fn recv_stun_response(buf: &[u8]) -> Option<SocketAddr> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mapped_nat_type, stun_test_nat0};
+    use crate::nat::NatType;
+    use std::collections::HashSet;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    use tokio::net::UdpSocket;
+
+    async fn mock_stun_server(
+        mapped_addr: stun_format::SocketAddr,
+    ) -> (String, tokio::task::JoinHandle<SocketAddr>) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = socket.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut request = [0_u8; 1024];
+            let (len, peer_addr) = socket.recv_from(&mut request).await.unwrap();
+            let request = stun_format::Msg::from(&request[..len]);
+            let tid = request.tid().unwrap();
+
+            let mut response = [0_u8; 64];
+            let mut response = stun_format::MsgBuilder::from(response.as_mut_slice());
+            response.typ(stun_format::MsgType::BindingResponse);
+            response.tid(tid);
+            response.add_attr(stun_format::Attr::MappedAddress(mapped_addr));
+            socket
+                .send_to(response.as_bytes(), peer_addr)
+                .await
+                .unwrap();
+            peer_addr
+        });
+        (server_addr.to_string(), task)
+    }
+
+    #[test]
+    fn mapped_addresses_from_different_families_do_not_imply_symmetric_nat() {
+        let ipv4 = HashSet::from([SocketAddr::from((Ipv4Addr::LOCALHOST, 1000))]);
+        let ipv6 = HashSet::from([SocketAddr::from((Ipv6Addr::LOCALHOST, 2000))]);
+
+        assert_eq!(mapped_nat_type(&ipv4, &ipv6), NatType::Cone);
+    }
+
+    #[tokio::test]
+    async fn stun_reuses_one_socket_per_family_and_skips_resolution_failures() {
+        let mapped = stun_format::SocketAddr::V4([203, 0, 113, 10], 40000);
+        let (server1, peer1) = mock_stun_server(mapped).await;
+        let (server2, peer2) = mock_stun_server(mapped).await;
+
+        let result = stun_test_nat0(
+            vec!["not a socket address".to_owned(), server1, server2],
+            None,
+            Some(Ipv4Addr::LOCALHOST),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let peer1 = peer1.await.unwrap();
+        let peer2 = peer2.await.unwrap();
+        assert_eq!(peer1.port(), peer2.port());
+        assert_eq!(result.nat_type, NatType::Cone);
+        assert_eq!(result.public_ipv4, vec![Ipv4Addr::new(203, 0, 113, 10)]);
+        assert_eq!(result.public_udp_ports, vec![40000]);
+    }
 }

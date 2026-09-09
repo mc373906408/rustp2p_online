@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::endpoint::codec::InitCodec;
 use crate::socket::LocalInterface;
@@ -26,9 +26,11 @@ pub struct Config {
     pub(crate) mapping_tcp_addr: Vec<SocketAddr>,
     pub(crate) mapping_udp_addr: Vec<SocketAddr>,
     pub(crate) default_interface: Option<LocalInterface>,
-    /// Whether to also serve IPv6. When true, the main UDP pair includes an IPv6
-    /// socket and the TCP listener is dual-stack on `[::]`; when the system
-    /// has no IPv6 support, binding silently falls back to IPv4 only.
+    pub(crate) bind_ipv4: Option<Ipv4Addr>,
+    pub(crate) bind_ipv6: Option<Ipv6Addr>,
+    /// Whether to also serve IPv6. When true, the main UDP pair and TCP
+    /// listeners include IPv6 sockets; when the system has no IPv6 support,
+    /// binding silently falls back to IPv4 only.
     pub(crate) enable_ipv6: bool,
     /// Maximum UDP datagram size the listener can receive.
     pub(crate) max_udp_datagram_size: usize,
@@ -45,6 +47,8 @@ impl Default for Config {
             mapping_tcp_addr: vec![],
             mapping_udp_addr: vec![],
             default_interface: None,
+            bind_ipv4: None,
+            bind_ipv6: None,
             enable_ipv6: true,
             max_udp_datagram_size: DEFAULT_MAX_UDP_DATAGRAM_SIZE,
         }
@@ -79,8 +83,8 @@ impl Config {
 
     /// Enables TCP on `port`. When `port` is zero, binding first tries the
     /// actual main UDP port and falls back to an OS-assigned port if that TCP
-    /// port is already occupied. With [`enable_ipv6`](Self::enable_ipv6), the
-    /// listener is dual-stack and serves both families on one port.
+    /// port is already occupied. With [`enable_ipv6`](Self::enable_ipv6),
+    /// separate IPv4 and IPv6 listeners serve both families on one port.
     pub fn tcp_port(mut self, port: u16) -> Self {
         self.tcp_port = Some(port);
         self
@@ -119,6 +123,25 @@ impl Config {
     /// outgoing interface, inbound wildcard listeners remain wildcard-bound.
     pub fn default_interface(mut self, interface: LocalInterface) -> Self {
         self.default_interface = Some(interface);
+        self
+    }
+
+    /// Bind IPv4 sockets to this local address instead of `0.0.0.0`.
+    ///
+    /// This applies to the main and assistant UDP sockets, the TCP listener
+    /// and outbound TCP connections, STUN queries, and local NAT reporting.
+    pub fn bind_ipv4(mut self, ip: Ipv4Addr) -> Self {
+        self.bind_ipv4 = Some(ip);
+        self
+    }
+
+    /// Bind IPv6 sockets to this local address instead of `[::]`.
+    ///
+    /// This applies to the main UDP socket, TCP listener and outbound TCP
+    /// connections, STUN queries, and local NAT reporting. This setting has
+    /// no effect while [`enable_ipv6`](Self::enable_ipv6) is disabled.
+    pub fn bind_ipv6(mut self, ip: Ipv6Addr) -> Self {
+        self.bind_ipv6 = Some(ip);
         self
     }
 
