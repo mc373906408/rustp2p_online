@@ -96,6 +96,7 @@ let incoming = TunnelIncoming::bind(
 .await?;
 
 println!("IPv4 TCP: {:?}", incoming.local_tcp_addr());
+println!("IPv6 UDP: {:?}", incoming.local_udp_ipv6_addr());
 println!("IPv6 TCP: {:?}", incoming.local_tcp_ipv6_addr());
 # Ok(())
 # }

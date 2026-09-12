@@ -37,6 +37,7 @@ pub struct TunnelIncoming {
     pool: Arc<SocketPool>,
     tunnel_rx: mpsc::Receiver<Tunnel>,
     config: Config,
+    local_udp_ipv6_addr: Option<SocketAddr>,
     local_tcp_addr: Option<SocketAddr>,
     local_tcp_ipv6_addr: Option<SocketAddr>,
 }
@@ -58,6 +59,7 @@ impl TunnelIncoming {
             config.default_interface.as_ref(),
         )
         .await?;
+        let local_udp_ipv6_addr = main_v6.as_ref().and_then(|s| s.local_addr().ok());
         let udp_v4_port = main_v4.local_addr()?.port();
         let pool = Arc::new(SocketPool::new(
             main_v4,
@@ -87,6 +89,7 @@ impl TunnelIncoming {
             pool,
             tunnel_rx,
             config,
+            local_udp_ipv6_addr,
             local_tcp_addr,
             local_tcp_ipv6_addr,
         };
@@ -136,6 +139,11 @@ impl TunnelIncoming {
             .iter()
             .filter_map(|s| s.local_addr().ok().map(|addr| addr.port()))
             .collect()
+    }
+
+    /// The local IPv6 UDP socket address, if IPv6 UDP handling is enabled.
+    pub fn local_udp_ipv6_addr(&self) -> Option<SocketAddr> {
+        self.local_udp_ipv6_addr
     }
 
     /// The local IPv4 TCP listener address, `None` when TCP or IPv4 handling
@@ -584,6 +592,7 @@ mod tests {
             listener.local_addr().unwrap().ip(),
             std::net::IpAddr::V4(bind_ip)
         );
+        assert!(listener.local_udp_ipv6_addr().is_none());
         assert_eq!(
             listener.local_tcp_addr().unwrap().ip(),
             std::net::IpAddr::V4(bind_ip)
@@ -626,6 +635,12 @@ mod tests {
             listener.local_addr().unwrap().ip(),
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
         );
+        let udp_v6 = listener.local_udp_ipv6_addr().unwrap();
+        assert_eq!(
+            udp_v6.ip(),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        );
+        assert_eq!(udp_v6.port(), listener.local_addr().unwrap().port());
         assert_eq!(
             listener.local_tcp_addr().unwrap().ip(),
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
