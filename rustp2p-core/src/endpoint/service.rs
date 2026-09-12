@@ -287,11 +287,12 @@ fn spawn_tcp_accept_loop(
                     match result {
                         Ok((stream, peer_addr)) => {
                             log::debug!("TCP connection from {peer_addr}");
-                            if let Some(interface) = default_interface.as_ref() {
-                                if let Err(e) = crate::socket::set_tcp_stream_interface(&stream, interface) {
-                                    log::warn!("TCP interface setup error for {peer_addr}: {e}");
-                                    continue;
-                                }
+                            if let Err(e) = crate::socket::configure_accepted_tcp_stream(
+                                &stream,
+                                default_interface.as_ref(),
+                            ) {
+                                log::warn!("TCP stream setup error for {peer_addr}: {e}");
+                                continue;
                             }
                             if let Err(e) = pool.publish_tcp(stream, peer_addr, None).await {
                                 log::warn!("TCP setup error: {e}");

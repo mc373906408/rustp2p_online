@@ -146,15 +146,18 @@ pub(crate) fn bind_tcp_listener(
     tokio::net::TcpListener::from_std(socket.into())
 }
 
-/// Applies the selected interface to an accepted TCP stream. Listener socket
-/// option inheritance varies by platform, so accepted connections are
-/// configured explicitly as well.
-pub(crate) fn set_tcp_stream_interface(
+/// Configures an accepted TCP stream. Listener socket option inheritance
+/// varies by platform, so stream options are applied explicitly.
+pub(crate) fn configure_accepted_tcp_stream(
     stream: &tokio::net::TcpStream,
-    interface: &LocalInterface,
+    interface: Option<&LocalInterface>,
 ) -> io::Result<()> {
-    let socket = socket2::SockRef::from(stream);
-    socket.set_ip_unicast_if(interface, stream.peer_addr()?.is_ipv6())
+    stream.set_nodelay(true)?;
+    if let Some(interface) = interface {
+        let socket = socket2::SockRef::from(stream);
+        socket.set_ip_unicast_if(interface, stream.peer_addr()?.is_ipv6())?;
+    }
+    Ok(())
 }
 
 /// Upper bound for a single non-blocking TCP connect attempt. Without this,
@@ -239,7 +242,7 @@ pub(crate) fn create_tcp0(
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_tcp_listener, create_tcp0};
+    use super::{bind_tcp_listener, configure_accepted_tcp_stream, create_tcp0};
     #[cfg(any(target_os = "linux", target_os = "android"))]
     use super::{bind_udp, LocalInterface};
     use std::net::SocketAddr;
@@ -274,9 +277,23 @@ mod tests {
         .unwrap();
         stream.writable().await.unwrap();
         assert!(stream.take_error().unwrap().is_none());
+        assert!(stream.nodelay().unwrap());
         let (_, peer_addr) = remote_listener.accept().await.unwrap();
 
         assert_eq!(stream.local_addr().unwrap().port(), local_port);
         assert_eq!(peer_addr.port(), local_port);
+    }
+
+    #[tokio::test]
+    async fn accepted_tcp_stream_disables_nagle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await });
+        let (stream, _) = listener.accept().await.unwrap();
+        let _client = client.await.unwrap().unwrap();
+
+        configure_accepted_tcp_stream(&stream, None).unwrap();
+
+        assert!(stream.nodelay().unwrap());
     }
 }
